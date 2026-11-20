@@ -125,7 +125,7 @@ curl -i "http://localhost:8080/api/slow?ms=7000"             # 백엔드가 느�
 ```bash
 make integration   # Python 통합 테스트 44개: 실제 서버 + 백엔드 fixture, raw socket
 make smoke         # curl 스모크 29개 (Linux용: stat -c 사용)
-make test-asan     # ASan+UBSan 빌드로 통합 테스트
+make test-asan     # ASan+UBSan(+LSan) 빌드로 통합 테스트 (LSan은 Linux만. macOS는 ASAN_OPTIONS=detect_leaks=0으로 직접 실행)
 make test-tsan     # TSan 빌드로 통합 테스트
 make load          # 동시 클라이언트 부하
 ```
@@ -139,11 +139,12 @@ make load          # 동시 클라이언트 부하
 |---|---|
 | 빌드 경고 | 0 |
 | 통합 | 42 / 44 통과. 남은 2개(`test_no_fd_leak_*`)는 Linux `/proc`을 읽는 테스트라 macOS에서 실행 불가 → 같은 요청을 보내고 `lsof`로 셌을 때 fd 7 → 7, 스레드 5 → 5 |
+| 통합 (ASan+UBSan 빌드, detect_leaks=0) | 42 / 44 통과 (같은 2개 제외), 보고 0건 |
 | 통합 (TSan 빌드) | 42 / 44 통과 (같은 2개 제외), TSan 경고 0 |
 | curl 스모크 | 28 / 29 통과. 남은 1개는 GNU `stat -c`를 써서 macOS에서 실패 (파일 크기 1388 = 받은 크기 1388로 직접 확인) |
 | 부하 50 clients × 200 req (정적+프록시 혼합, 8 스레드) | 약 7,600 req/s, 오류 0 |
 | 부하 100 clients × 200 req (정적만, 4 스레드) | 약 10,000 req/s, 오류 0 |
-| Linux(WSL2)에서 실행 | 미검증 |
+| Linux(WSL2)에서 실행, LeakSanitizer | 미검증 |
 
 ## 6. 디렉터리 구조
 
