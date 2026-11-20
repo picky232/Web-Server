@@ -1,0 +1,4 @@
+# Keep LF line endings for C sources, scripts and Makefile even on Windows checkouts
+* text=auto eol=lf
+*.png binary
+*.jpg binary
