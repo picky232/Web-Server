@@ -3,6 +3,7 @@
 #include "net.h"
 #include "response.h"
 #include "static.h"
+#include "threadpool.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -48,6 +49,9 @@ static int read_request(struct conn *c, int first)
         if (left <= 0)
             return c->len ? 408 : 0;
         if (g_stop)
+            return 0;
+        /* 다음 요청을 기다리며 놀고 있는데 큐에 새 연결이 기다리면, 이 연결을 닫고 스레드를 비켜 준다 */
+        if (c->len == 0 && !first && pool_waiting() > 0)
             return 0;
         int w = net_wait(c->fd, POLLIN, left < SLICE_MS ? (int)left : SLICE_MS);
         if (w < 0)

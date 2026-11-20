@@ -1,7 +1,9 @@
 #include "config.h"
 #include "conn.h"
 #include "net.h"
+#include "response.h"
 #include "static.h"
+#include "threadpool.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -41,6 +43,8 @@ int main(int argc, char **argv)
     int listenfd = net_listen(g_cfg.bind_addr, g_cfg.port, &port);
     if (listenfd < 0)
         return 1;
+    if (pool_start(g_cfg.threads, g_cfg.queue, conn_handle) < 0)
+        return 1;
     fprintf(stderr, "listening on http://%s:%d\n", g_cfg.bind_addr, port);
 
     while (!g_stop) {
@@ -58,10 +62,16 @@ int main(int argc, char **argv)
         setsockopt(connfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         char ip[INET_ADDRSTRLEN] = "?";
         inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
-        conn_handle(connfd, ip);
+        /* 메인 스레드는 받아서 큐에 넣기만 한다. 실제 처리는 작업 스레드 몫 */
+        if (pool_submit(connfd, ip) < 0) {
+            send_error(connfd, 503, 0, "Retry-After: 1\r\n", 0); /* 큐가 가득 참: 잠시 뒤 다시 */
+            shutdown(connfd, SHUT_WR);
+            close(connfd);
+        }
     }
 
-    close(listenfd);
+    close(listenfd); /* 이제 새 연결은 거절된다 */
+    pool_stop();     /* 처리 중인 요청은 끝까지 마치고 스레드를 거둔다 */
     fprintf(stderr, "shutdown complete\n");
     return 0;
 }
