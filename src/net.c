@@ -2,6 +2,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
@@ -49,11 +51,58 @@ int net_listen(const char *addr, int port, int *actual_port)
 
 int net_wait(int fd, short events, int timeout_ms)
 {
-    struct pollfd p = {.fd = fd, .events = events};
-    int r = poll(&p, 1, timeout_ms);
-    if (r < 0)
-        return errno == EINTR ? 0 : -1; /* 시그널로 깼으면 "아직 아님"으로 본다 */
-    return r;
+    long long deadline = net_now_ms() + timeout_ms;
+    for (;;) {
+        struct pollfd p = {.fd = fd, .events = events};
+        int r = poll(&p, 1, timeout_ms);
+        if (r >= 0)
+            return r;
+        if (errno != EINTR)
+            return -1;
+        /* 시그널(Ctrl+C 등)에 깨어난 것뿐이면 남은 시간만큼 다시 기다린다 */
+        timeout_ms = (int)(deadline - net_now_ms());
+        if (timeout_ms <= 0)
+            return 0;
+    }
+}
+
+int net_connect(const char *host, const char *port, int timeout_ms)
+{
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port, &hints, &res) != 0) {
+        errno = EHOSTUNREACH;
+        return -1;
+    }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int err = fd < 0 ? errno : 0;
+    if (fd >= 0) {
+        /* 그냥 connect하면 응답 없는 상대에게 수십 초 멈춘다. non-blocking으로 걸고 poll로 기다린다 */
+        int flags = fcntl(fd, F_GETFL);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+            err = errno;
+            if (err == EINPROGRESS) {
+                socklen_t elen = sizeof err;
+                int w = net_wait(fd, POLLOUT, timeout_ms);
+                if (w == 0)
+                    err = ETIMEDOUT;
+                else if (w < 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0)
+                    err = errno;
+            }
+        }
+        fcntl(fd, F_SETFL, flags); /* 연결된 뒤에는 다시 blocking */
+    }
+    freeaddrinfo(res);
+    if (err) {
+        if (fd >= 0)
+            close(fd);
+        errno = err;
+        return -1;
+    }
+    return fd;
 }
 
 int net_send_all(int fd, const void *buf, size_t n)

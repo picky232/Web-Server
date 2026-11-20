@@ -9,6 +9,9 @@ int net_listen(const char *addr, int port, int *actual_port);
 /* fd가 읽기/쓰기 가능해질 때까지 최대 timeout_ms 기다린다. 1 = 준비됨, 0 = 시간 초과, -1 = 에러 */
 int net_wait(int fd, short events, int timeout_ms);
 
+/* 백엔드에 연결한다. timeout_ms 안에 안 되면 -1 (errno = ETIMEDOUT), 거절되면 -1 (ECONNREFUSED 등) */
+int net_connect(const char *host, const char *port, int timeout_ms);
+
 /* n바이트를 전부 쓸 때까지 send를 반복한다. 0 = 성공, -1 = 연결이 끊김/시간 초과 */
 int net_send_all(int fd, const void *buf, size_t n);
 

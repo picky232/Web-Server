@@ -1,7 +1,9 @@
 #include "conn.h"
 #include "config.h"
 #include "net.h"
+#include "proxy.h"
 #include "response.h"
+#include "router.h"
 #include "static.h"
 #include "threadpool.h"
 
@@ -50,14 +52,16 @@ static int read_request(struct conn *c, int first)
             return c->len ? 408 : 0;
         if (g_stop)
             return 0;
-        /* 다음 요청을 기다리며 놀고 있는데 큐에 새 연결이 기다리면, 이 연결을 닫고 스레드를 비켜 준다 */
-        if (c->len == 0 && !first && pool_waiting() > 0)
-            return 0;
         int w = net_wait(c->fd, POLLIN, left < SLICE_MS ? (int)left : SLICE_MS);
         if (w < 0)
             return 0;
-        if (w == 0)
+        if (w == 0) {
+            /* 한 간격(0.1초) 동안 아무것도 안 온 유휴 연결인데 큐에 새 연결이 기다리면,
+               이 연결을 닫고 스레드를 비켜 준다. 데이터가 없을 때만 판단해야 도착한 요청을 안 버린다 */
+            if (c->len == 0 && !first && pool_waiting() > 0)
+                return 0;
             continue;
+        }
         ssize_t r = recv(c->fd, c->buf + c->len, CONN_BUF - c->len, 0);
         if (r < 0 && errno == EINTR)
             continue;
@@ -118,6 +122,8 @@ static int dispatch(struct conn *c)
             c->keep = 0;
         return send_error(c->fd, st, c->keep, NULL, is_head(c)) < 0 ? -1 : st;
     }
+    if (router_is_proxy(path))
+        return proxy_forward(c); /* /api/... → 백엔드. 본문은 프록시가 백엔드로 흘려보낸다 */
     if (conn_read_body(c, -1) < 0) /* 정적 파일은 본문을 쓰지 않으니 먼저 버린다 */
         return -1;
     return static_serve(c, path);
@@ -161,7 +167,10 @@ void conn_handle(int fd, const char *ip)
             net_close_lingering(fd);
             break;
         }
-        c->keep = c->req.keep_alive && n + 1 < g_cfg.max_requests && !g_stop;
+        /* 큐에 기다리는 연결이 있으면 이번 응답에 "Connection: close"를 실어 보낸다.
+           말없이 닫으면 클라이언트가 이미 보낸 다음 요청이 허공에 뜬다 */
+        c->keep = c->req.keep_alive && n + 1 < g_cfg.max_requests && !g_stop &&
+                  pool_waiting() == 0;
 
         int st = dispatch(c);
         if (st < 0) {
