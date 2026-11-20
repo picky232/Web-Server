@@ -1,6 +1,8 @@
 #include "config.h"
+#include "conn.h"
 #include "net.h"
 
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -10,41 +12,12 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-static volatile sig_atomic_t g_stop;
+volatile sig_atomic_t g_stop;
 
 static void on_signal(int sig)
 {
     (void)sig;
     g_stop = 1; /* 핸들러에서는 깃발만 세운다. 정리는 메인 루프가 한다 */
-}
-
-/* 1단계: 요청 내용은 보지 않고 빈 줄까지만 읽은 뒤 고정 응답을 보낸다 */
-static void handle_fixed(int fd)
-{
-    char buf[8192];
-    size_t len = 0;
-    while (len < sizeof buf - 1) {
-        if (net_wait(fd, POLLIN, g_cfg.read_timeout_ms) <= 0)
-            break;
-        ssize_t r = recv(fd, buf + len, sizeof buf - 1 - len, 0);
-        if (r <= 0)
-            break;
-        len += (size_t)r;
-        buf[len] = '\0';
-        if (strstr(buf, "\r\n\r\n"))
-            break;
-    }
-    if (len > 0)
-        fprintf(stderr, "%.*s\n", (int)(strcspn(buf, "\r\n")), buf); /* 요청 첫 줄만 찍기 */
-
-    const char res[] = "HTTP/1.1 200 OK\r\n"
-                       "Content-Type: text/plain; charset=utf-8\r\n"
-                       "Content-Length: 6\r\n"
-                       "Connection: close\r\n"
-                       "\r\n"
-                       "hello\n";
-    net_send_all(fd, res, sizeof res - 1);
-    net_close_lingering(fd);
 }
 
 int main(int argc, char **argv)
@@ -80,7 +53,9 @@ int main(int argc, char **argv)
         struct timeval tv = {.tv_sec = g_cfg.read_timeout_ms / 1000,
                              .tv_usec = (g_cfg.read_timeout_ms % 1000) * 1000};
         setsockopt(connfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-        handle_fixed(connfd);
+        char ip[INET_ADDRSTRLEN] = "?";
+        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+        conn_handle(connfd, ip);
     }
 
     close(listenfd);
