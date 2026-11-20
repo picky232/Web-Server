@@ -7,6 +7,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -60,6 +61,9 @@ int main(int argc, char **argv)
         struct timeval tv = {.tv_sec = g_cfg.read_timeout_ms / 1000,
                              .tv_usec = (g_cfg.read_timeout_ms % 1000) * 1000};
         setsockopt(connfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        /* 헤더와 본문을 따로 send하면 Nagle + 지연 ACK가 겹쳐 응답마다 수십 ms 멈출 수 있다 */
+        int one = 1;
+        setsockopt(connfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         char ip[INET_ADDRSTRLEN] = "?";
         inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
         /* 메인 스레드는 받아서 큐에 넣기만 한다. 실제 처리는 작업 스레드 몫 */
