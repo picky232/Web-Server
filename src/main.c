@@ -1,6 +1,7 @@
 #include "config.h"
 #include "conn.h"
 #include "net.h"
+#include "static.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -25,6 +26,8 @@ int main(int argc, char **argv)
     int rc = config_parse(argc, argv);
     if (rc != 0)
         return rc > 0 ? 0 : 2;
+    if (static_init(g_cfg.root) < 0)
+        return 2;
 
     /* 끊긴 연결에 write하면 SIGPIPE로 프로세스가 죽는다. 무시하고 EPIPE 에러로 받는다 */
     signal(SIGPIPE, SIG_IGN);

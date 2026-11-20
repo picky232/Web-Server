@@ -2,6 +2,7 @@
 #include "config.h"
 #include "net.h"
 #include "response.h"
+#include "static.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -113,14 +114,9 @@ static int dispatch(struct conn *c)
             c->keep = 0;
         return send_error(c->fd, st, c->keep, NULL, is_head(c)) < 0 ? -1 : st;
     }
-    if (conn_read_body(c, -1) < 0)
+    if (conn_read_body(c, -1) < 0) /* 정적 파일은 본문을 쓰지 않으니 먼저 버린다 */
         return -1;
-    /* 2단계: 파싱까지는 진짜, 응답 내용은 아직 고정 */
-    const char body[] = "hello\n";
-    if (send_body(c->fd, 200, "text/plain; charset=utf-8", body, sizeof body - 1, c->keep,
-                  NULL, is_head(c)) < 0)
-        return -1;
-    return 200;
+    return static_serve(c, path);
 }
 
 static void access_log(const struct conn *c, int status)
