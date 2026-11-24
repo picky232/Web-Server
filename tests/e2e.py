@@ -1170,7 +1170,7 @@ class Observe(Case):
                 burst(c, 50)
             c.close()
             p.terminate()
-            self.assertEqual(p.wait(5), 0)
+            self.assertEqual(p.wait(5), 0)  # sanitizer가 무언가 찾았으면 0이 아니다
         finally:
             os.close(r)
             if p.poll() is None:
@@ -1423,8 +1423,10 @@ class Supervisor(unittest.TestCase):
         if self.p.poll() is None:
             self.p.terminate()
             self.p.wait(15)
+        text = Path(self.d, "err").read_text()
         self.err.close()
         shutil.rmtree(self.d, ignore_errors=True)
+        self.assertNotRegex(text, r"Sanitizer|runtime error")
 
     def write(self, which, extra=""):
         self.conf.write_text(f"listen 127.0.0.1:{self.port}\nloops 2\naccess_log off\nroute * / static {self.d}/{which}\n{extra}")
