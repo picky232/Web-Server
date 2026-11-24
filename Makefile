@@ -3,6 +3,7 @@
 # make unit/e2e   각각 따로
 # make asan/tsan  sanitizer 빌드 (build/asan, build/tsan)
 # make bench      부하 측정 (ab, 있으면 wrk)
+# make demo       좌석 예매 데모 빌드 → build/seats (실행은 demo/run.sh)
 # make clean
 
 CC     ?= cc
@@ -31,7 +32,10 @@ OBJS := $(SRCS:src/%.c=$(BUILD)/obj/%.o)
 UNIT_OBJS := $(filter-out $(BUILD)/obj/main.o,$(OBJS)) \
              $(patsubst tests/unit/%.c,$(BUILD)/unit/%.o,$(wildcard tests/unit/*.c))
 
-.PHONY: all bench unit e2e test fault asan tsan clean
+# 데모 백엔드 = 서버 본체 그대로 + 앱만 바꿔 끼움
+DEMO_OBJS := $(filter-out $(BUILD)/obj/app.o,$(OBJS)) $(BUILD)/demo/seats.o
+
+.PHONY: all bench demo unit e2e test fault asan tsan clean
 all: $(BUILD)/webserver
 
 $(BUILD)/webserver: $(OBJS)
@@ -40,6 +44,13 @@ $(BUILD)/webserver: $(OBJS)
 $(BUILD)/unit_tests: $(UNIT_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
 
+$(BUILD)/seats: $(DEMO_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+$(BUILD)/demo/%.o: demo/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
 $(BUILD)/obj/%.o: src/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
@@ -47,6 +58,8 @@ $(BUILD)/obj/%.o: src/%.c
 $(BUILD)/unit/%.o: tests/unit/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+demo: $(BUILD)/webserver $(BUILD)/seats
 
 unit: $(BUILD)/unit_tests
 	$(BUILD)/unit_tests
@@ -72,4 +85,4 @@ tsan:
 clean:
 	rm -rf build
 
--include $(OBJS:.o=.d) $(UNIT_OBJS:.o=.d)
+-include $(OBJS:.o=.d) $(UNIT_OBJS:.o=.d) $(DEMO_OBJS:.o=.d)

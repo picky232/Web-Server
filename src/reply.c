@@ -21,6 +21,7 @@ const char *status_text(int s)
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 408: return "Request Timeout";
+    case 409: return "Conflict";
     case 413: return "Content Too Large";
     case 414: return "URI Too Long";
     case 417: return "Expectation Failed";
