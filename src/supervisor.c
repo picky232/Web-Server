@@ -39,7 +39,7 @@ struct inherited supervisor_inherit(void)
     if (!v)
         return in;
     in.n = atoi(v);
-    unsetenv(ENV_NAME); /* CGI 자식까지 내려가지 않게 */
+    unsetenv(ENV_NAME); /* 이 워커에게만 주는 값. 다른 프로그램을 띄우게 되더라도 내려가지 않게 */
     if (in.n < 1 || in.n > 2) {
         in.n = 0;
         return in;

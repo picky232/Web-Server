@@ -15,7 +15,6 @@ struct server {
     char via[64]; /* Via 헤더에 쓰는 내 이름 */
     atomic_int loops_alive;
     atomic_int phase; /* enum phase. 메인이 바꾸고 루프가 매 바퀴 읽는다 */
-    atomic_int cgi_running;
     int log_fd; /* -1 = 끔 */
     bool log_regular; /* 로그가 보통 파일인가 (파이프·터미널이면 막힐 수 있다) */
     struct cache *cache; /* NULL = 끔 */

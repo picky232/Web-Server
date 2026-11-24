@@ -1,5 +1,4 @@
 #include "loop.h"
-#include "cgi.h"
 #include "conn.h"
 #include "crash.h"
 #include "log.h"
@@ -16,7 +15,6 @@
 
 #define MAX_EVENTS 256
 #define SCAN_MS 250 /* 제한 시간 검사 간격 */
-#define REAP_MS 5
 
 void loop_watch(struct loop *l, struct io *io, unsigned want)
 {
@@ -45,7 +43,6 @@ static void reap_dead(struct loop *l)
         switch (io->kind) {
         case IO_CLIENT: conn_free((struct conn *)io); break;
         case IO_UPSTREAM: upconn_free((struct upconn *)io); break;
-        case IO_CGI: cgi_proc_free((struct cgi_proc *)io); break;
         default: free(io); break;
         }
     }
@@ -100,7 +97,7 @@ static void *loop_main(void *arg)
     while (!l->quit) {
         atomic_fetch_add_explicit(&l->beats, 1, memory_order_relaxed);
         /* 루프 스레드가 잠드는 곳은 프로그램 전체에서 이 한 줄뿐이다 */
-        int n = ev_wait(l->evfd, ev, MAX_EVENTS, l->ready ? 0 : l->reaping ? REAP_MS : SCAN_MS);
+        int n = ev_wait(l->evfd, ev, MAX_EVENTS, l->ready ? 0 : SCAN_MS);
         long long woke = now_us();
         l->now = woke / 1000;
         int phase = atomic_load(&l->srv->phase);
@@ -115,7 +112,6 @@ static void *loop_main(void *arg)
             case IO_PIPE: read_mail(l); break;
             case IO_CLIENT: conn_run((struct conn *)io); break;
             case IO_UPSTREAM: upstream_event((struct upconn *)io); break;
-            case IO_CGI: cgi_event((struct cgi_proc *)io); break;
             default: break;
             }
         }
@@ -123,11 +119,8 @@ static void *loop_main(void *arg)
         if (l->now >= l->next_scan || l->draining) {
             conn_scan(l);
             upstream_scan(l);
-            l->reaping = l->children != NULL;
             l->next_scan = l->now + SCAN_MS;
         }
-        if (l->reaping)
-            cgi_reap(l, false);
         reap_dead(l);
         log_flush(l);
         long long busy = now_us() - woke;
@@ -141,7 +134,6 @@ static void *loop_main(void *arg)
     }
     conn_close_all(l);
     upstream_close_all(l);
-    cgi_reap(l, true);
     reap_dead(l);
     log_flush(l);
     buf_free(&l->log);

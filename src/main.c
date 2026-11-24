@@ -41,8 +41,6 @@ static void setup_signals(void)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGQUIT, &sa, NULL);
-    sa.sa_handler = SIG_DFL; /* 무시 상태를 물려받으면 커널이 CGI 자식을 알아서 치워 우리가 회수할 수 없다 */
-    sigaction(SIGCHLD, &sa, NULL);
     sa.sa_handler = SIG_IGN; /* 끊긴 연결에 쓰면 프로세스가 죽는 대신 EPIPE를 받는다 */
     sigaction(SIGPIPE, &sa, NULL);
 }

@@ -2,7 +2,6 @@
 #define EXCHANGE_H
 
 #include "body.h"
-#include "cgi.h"
 #include "http.h"
 #include "reply.h"
 #include "spool.h"
@@ -23,13 +22,13 @@ struct static_st {
 struct conn;
 struct route;
 
-/* 응답을 만들어 내는 쪽의 공통 모양. 정적 파일·백엔드 중계·CGI·상태 페이지가 이 함수들만 채우면 된다.
-   새 기능(캐시, 포워드 프록시)도 여기에 하나 더 끼우는 것으로 끝난다 */
+/* 응답을 만들어 내는 쪽의 공통 모양. 정적 파일·백엔드 중계·캐시·상태 페이지가 이 함수들만 채우면 된다.
+   새 기능도 여기에 하나 더 끼우는 것으로 끝난다 */
 struct handler {
     const char *name;
     void (*start)(struct conn *c);    /* 본문까지 다 받은 뒤 한 번 */
     bool (*pump)(struct conn *c);     /* 이어서 만들기. 조금이라도 나아갔으면 true */
-    void (*interest)(struct conn *c); /* 상대 소켓(백엔드, CGI)을 어느 방향으로 지켜볼지 다시 계산 */
+    void (*interest)(struct conn *c); /* 백엔드 소켓을 어느 방향으로 지켜볼지 다시 계산 */
     void (*timeout)(struct conn *c);  /* ex->deadline이 지남 */
     void (*stop)(struct conn *c);     /* 끝났거나 클라이언트가 떠남: 자원 회수 */
 };
@@ -56,7 +55,6 @@ struct exchange {
     union {
         struct static_st file;
         struct proxy_st proxy;
-        struct cgi_st cgi;
         struct cache_st cache;
     } u; /* 핸들러별 상태 */
 };

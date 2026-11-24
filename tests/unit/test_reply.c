@@ -112,6 +112,5 @@ void test_spool(void)
 
     spool_init(&s, &disk);
     CHECK(spool_append(&s, "xyz", 3, 1000) == 0 && spool_read(&s, 1, b, 10) == 2 && b[0] == 'y');
-    CHECK(spool_to_file(&s) >= 0);
     spool_free(&s);
 }

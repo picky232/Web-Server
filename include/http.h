@@ -58,6 +58,5 @@ const struct field *fields_find(const struct fields *h, const char *name);
 bool fields_token(const struct fields *h, const char *name, const char *token); /* 같은 이름이 여러 줄이어도 */
 /* 이 구간(클라이언트↔우리, 우리↔백엔드)에서만 뜻이 있어 다음으로 넘기면 안 되는 헤더인가 */
 bool fields_hop_by_hop(const struct fields *h, struct sl name);
-bool http_is_token(struct sl s);
 
 #endif

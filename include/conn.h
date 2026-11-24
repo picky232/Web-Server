@@ -42,7 +42,7 @@ struct conn {
 };
 
 void conn_open(struct loop *l, int fd, int origin, const struct addr *peer);
-/* 막힐 때까지 진행한다. 클라이언트·백엔드·CGI 어느 쪽 이벤트가 와도 항상 이것 하나만 부른다.
+/* 막힐 때까지 진행한다. 클라이언트·백엔드 어느 쪽 이벤트가 와도 항상 이것 하나만 부른다.
    닫기와 관심 방향 계산은 이 함수의 마지막에서만 일어난다 */
 void conn_run(struct conn *c);
 void conn_set_state(struct conn *c, enum conn_state s);

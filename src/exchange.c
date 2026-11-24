@@ -78,7 +78,6 @@ static const struct handler *handler_for(const struct route *r)
     switch (r->act) {
     case ACT_STATIC: return &static_handler;
     case ACT_PROXY: return &proxy_handler;
-    case ACT_CGI: return &cgi_handler;
     }
     return NULL;
 }
@@ -88,8 +87,6 @@ static const char *allowed(const struct route *r, enum http_method m)
 {
     if (r->act == ACT_STATIC && m != M_GET && m != M_HEAD)
         return "Allow: GET, HEAD\r\n";
-    if (r->act == ACT_CGI && m != M_GET && m != M_HEAD && m != M_POST)
-        return "Allow: GET, HEAD, POST\r\n";
     return NULL;
 }
 

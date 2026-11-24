@@ -35,7 +35,7 @@ static bool is_tchar(unsigned char ch)
            (ch && strchr("!#$%&'*+-.^_`|~", ch));
 }
 
-bool http_is_token(struct sl s)
+static bool http_is_token(struct sl s)
 {
     for (size_t i = 0; i < s.n; i++)
         if (!is_tchar((unsigned char)s.p[i]))

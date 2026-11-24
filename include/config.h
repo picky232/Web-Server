@@ -4,15 +4,14 @@
 #include "balance.h"
 #include "net.h"
 
-enum action { ACT_STATIC, ACT_PROXY, ACT_CGI };
+enum action { ACT_STATIC, ACT_PROXY };
 
 struct route {
     char host[256];   /* "*" = 아무 호스트나 */
     char prefix[256]; /* 끝의 '/'를 뗀 모양. "/" → "" */
     size_t prefix_len;
     enum action act;
-    int root_fd;        /* static, cgi: 폴더 */
-    char dir[512];
+    int root_fd;        /* static: 폴더 */
     struct pool *pool;  /* proxy */
     bool cache;
     bool cache_cookies; /* 쿠키가 있는 요청도 캐시를 쓴다. 모두에게 같은 응답인 경로에만 */
@@ -27,9 +26,8 @@ struct config {
     int loops; /* 0 = 코어 수 */
     int max_connections;
     long long max_body, max_disk, cache_size;
-    int max_cgi;
     int min_rate; /* 이보다 느리게(초당 바이트) 보내거나 받는 연결은 끊는다 */
-    int head_ms, idle_ms, connect_ms, response_ms, stall_ms, drain_ms, cgi_ms, health_ms;
+    int head_ms, idle_ms, connect_ms, response_ms, stall_ms, drain_ms, health_ms;
     char access_log[512]; /* 빈 문자열 = 끔, "-" = 표준 오류 */
     struct pool pools[16];
     int npools, nbackends;

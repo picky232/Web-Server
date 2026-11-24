@@ -68,13 +68,6 @@ ssize_t spool_read(const struct spool *s, long long off, void *dst, size_t n)
     return (ssize_t)n;
 }
 
-int spool_to_file(struct spool *s)
-{
-    if (s->fd < 0 && open_file(s) < 0)
-        return -1;
-    return lseek(s->fd, 0, SEEK_SET) < 0 ? -1 : s->fd;
-}
-
 void spool_free(struct spool *s)
 {
     buf_free(&s->mem);

@@ -15,7 +15,7 @@ int net_nonblock(int fd)
     int fl = fcntl(fd, F_GETFL);
     if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0)
         return -1;
-    return fcntl(fd, F_SETFD, FD_CLOEXEC); /* CGI 자식 프로세스가 우리 소켓을 물려받지 않게 */
+    return fcntl(fd, F_SETFD, FD_CLOEXEC); /* 감독이 띄우는 워커가 시키지 않은 fd까지 물려받지 않게 */
 }
 
 void net_nodelay(int fd)
@@ -141,19 +141,6 @@ int net_pipe(int p[2])
         return -1;
     }
     return 0;
-}
-
-int net_pipe_for_child(int p[2])
-{
-#ifdef __linux__
-    if (pipe2(p, O_CLOEXEC) < 0)
-        return -1;
-#else
-    if (pipe(p) < 0)
-        return -1;
-    fcntl(p[1], F_SETFD, FD_CLOEXEC);
-#endif
-    return net_nonblock(p[0]);
 }
 
 void net_ip(const struct addr *a, char *out, size_t cap)

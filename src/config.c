@@ -17,7 +17,6 @@ void config_defaults(struct config *c)
     c->max_body = 10 << 20;
     c->max_disk = 256 << 20;
     c->cache_size = 64 << 20;
-    c->max_cgi = 16;
     c->min_rate = 1024;
     c->head_ms = 10000;
     c->idle_ms = 15000;
@@ -25,7 +24,6 @@ void config_defaults(struct config *c)
     c->response_ms = 30000;
     c->stall_ms = 30000;
     c->drain_ms = 10000;
-    c->cgi_ms = 10000;
     c->health_ms = 2000;
     c->watchdog = true;
     strcpy(c->access_log, "-");
@@ -127,13 +125,12 @@ static bool parse_pool(struct config *c, char **t, int n, char *err, size_t cap)
 static bool open_dir(struct route *r, const char *dir, char *err, size_t cap)
 {
     r->root_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (r->root_fd < 0 || strlen(dir) >= sizeof r->dir)
+    if (r->root_fd < 0)
         return fail(err, cap, "폴더를 열 수 없습니다: %s: %s", dir, strerror(errno));
-    strcpy(r->dir, dir);
     return true;
 }
 
-/* route 호스트 접두사 static 폴더 | proxy 묶음 [cache [cookies]] | cgi 폴더 */
+/* route 호스트 접두사 static 폴더 | proxy 묶음 [cache [cookies]] */
 static bool parse_route(struct config *c, char **t, int n, char *err, size_t cap)
 {
     if (n < 5)
@@ -153,10 +150,6 @@ static bool parse_route(struct config *c, char **t, int n, char *err, size_t cap
         r->prefix[--r->prefix_len] = '\0';
     if (!strcmp(t[3], "static")) {
         r->act = ACT_STATIC;
-        if (!open_dir(r, t[4], err, cap))
-            return false;
-    } else if (!strcmp(t[3], "cgi")) {
-        r->act = ACT_CGI;
         if (!open_dir(r, t[4], err, cap))
             return false;
     } else if (!strcmp(t[3], "proxy")) {
@@ -207,7 +200,7 @@ bool config_line(struct config *c, char *line, char *err, size_t cap)
     } times[] = {
         {"timeout_head", &c->head_ms}, {"timeout_idle", &c->idle_ms}, {"timeout_connect", &c->connect_ms},
         {"timeout_response", &c->response_ms}, {"timeout_stall", &c->stall_ms}, {"timeout_drain", &c->drain_ms},
-        {"timeout_cgi", &c->cgi_ms}, {"health_interval", &c->health_ms},
+        {"health_interval", &c->health_ms},
     };
     for (size_t i = 0; i < sizeof times / sizeof times[0]; i++)
         if (!strcmp(t[0], times[i].name))
@@ -232,9 +225,6 @@ bool config_line(struct config *c, char *line, char *err, size_t cap)
         ok = parse_size(t[1], 0, 1LL << 40, &c->max_disk);
     } else if (!strcmp(t[0], "cache_size")) {
         ok = parse_size(t[1], 0, 1LL << 40, &c->cache_size);
-    } else if (!strcmp(t[0], "max_cgi")) {
-        ok = parse_size(t[1], 0, 1024, &v);
-        c->max_cgi = (int)v;
     } else if (!strcmp(t[0], "min_rate")) {
         ok = parse_size(t[1], 1, 1 << 30, &v);
         c->min_rate = (int)v;
@@ -329,7 +319,11 @@ int config_args(struct config *c, int argc, char **argv)
                 break;
             }
         char line[700];
-        snprintf(line, sizeof line, "route * / static %s", root ? root : "./www");
+        /* 잘린 경로도 실제로 있는 다른 폴더일 수 있다. 그대로 열면 엉뚱한 폴더가 공개된다 */
+        if (snprintf(line, sizeof line, "route * / static %s", root ? root : "./www") >= (int)sizeof line) {
+            fprintf(stderr, "-r: 경로가 너무 깁니다\n");
+            return 2;
+        }
         if (!config_line(c, line, err, sizeof err)) {
             fprintf(stderr, "-r: %s\n", err);
             return 2;

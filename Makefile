@@ -3,7 +3,6 @@
 # make unit/e2e   각각 따로
 # make asan/tsan  sanitizer 빌드 (build/asan, build/tsan)
 # make bench      부하 측정 (ab, 있으면 wrk)
-# make cgi        CGI 예제 프로그램
 # make clean
 
 CC     ?= cc
@@ -32,14 +31,8 @@ OBJS := $(SRCS:src/%.c=$(BUILD)/obj/%.o)
 UNIT_OBJS := $(filter-out $(BUILD)/obj/main.o,$(OBJS)) \
              $(patsubst tests/unit/%.c,$(BUILD)/unit/%.o,$(wildcard tests/unit/*.c))
 
-.PHONY: all cgi bench unit e2e test fault asan tsan clean
+.PHONY: all bench unit e2e test fault asan tsan clean
 all: $(BUILD)/webserver
-
-# CGI 예제 프로그램
-cgi: cgi-bin/add
-cgi-bin/add: cgi-bin/add.c
-	$(CC) $(CFLAGS) -o $@ $<
-	@rm -f cgi-bin/*.d
 
 $(BUILD)/webserver: $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
@@ -67,7 +60,7 @@ fault:
 
 test: unit e2e
 
-bench: $(BUILD)/webserver cgi
+bench: $(BUILD)/webserver
 	WEBSERVER=$(BUILD)/webserver $(PYTHON) tests/bench.py
 
 asan:

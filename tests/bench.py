@@ -78,7 +78,7 @@ def main():
         port, bports = free_port(), [free_port(), free_port()]
         conf = Path(d, "c.conf")
         conf.write_text(f"listen 127.0.0.1:{port}\naccess_log off\npool p {' '.join(f'127.0.0.1:{b}' for b in bports)}\n"
-                        f"route * /api/ proxy p\nroute * /cgi-bin/ cgi {ROOT}/cgi-bin\nroute * / static {d}\n")
+                        f"route * /api/ proxy p\nroute * / static {d}\n")
         ps = [subprocess.Popen([sys.executable, str(ROOT / "tests/backend.py"), str(b)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for b in bports]
         srv = subprocess.Popen([BIN, "-c", str(conf)], stderr=subprocess.DEVNULL)
         try:
@@ -89,8 +89,6 @@ def main():
             table("정적 1KB, keep-alive 없음", url + "/1k.txt", (8, 200), 5000, keep=False)
             time.sleep(3)
             table("리버스 프록시 (Python 백엔드 2대가 한계)", url + "/api/x", (16, 64, 200), 20000)
-            if (ROOT / "cgi-bin/add").exists():
-                table("CGI (요청마다 프로세스)", url + "/cgi-bin/add?1&2", (8,), 1000, keep=False)
             if shutil.which("wrk"):
                 print("\n### wrk (여러 스레드)\n")
                 print(subprocess.run(["wrk", "-t4", "-c256", "-d5s", "--latency", url + "/1k.txt"], capture_output=True, text=True).stdout)

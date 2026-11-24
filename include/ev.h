@@ -11,7 +11,6 @@ enum io_kind {
     IO_LISTEN,   /* 새 연결을 받는 소켓 */
     IO_CLIENT,   /* struct conn */
     IO_UPSTREAM, /* struct upconn: 백엔드와의 연결 */
-    IO_CGI,      /* struct cgi_proc: CGI 프로그램의 출력 */
     IO_HEALTH,   /* 헬스 체크용 연결 */
 };
 

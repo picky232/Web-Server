@@ -11,7 +11,6 @@
 struct server;
 struct conn;
 struct idle_list;
-struct child;
 
 /* 메인 스레드가 루프 스레드에 보내는 쪽지. 파이프로 통째로 전달된다 (512바이트 이하는 쪼개지지 않음) */
 enum msg_type { MSG_CONN, MSG_WAKE };
@@ -36,8 +35,6 @@ struct loop {
     struct conn *ready;  /* 커널은 조용하지만 이어서 할 일이 남은 연결 */
     struct io *dead;     /* 이번 바퀴 끝에 free할 것 */
     struct idle_list *idle; /* 백엔드별로 쉬는 연결 */
-    struct child *children; /* 실행 중이거나 아직 회수하지 않은 CGI 자식 */
-    bool reaping;           /* 곧 끝날 자식이 있다 → 짧은 간격으로 회수를 시도 */
     struct buf log;         /* 바퀴 끝에 한 번에 쓰는 접근 로그 */
 
     /* 상태 페이지가 다른 스레드에서 읽는 숫자들 */

@@ -5,7 +5,7 @@
 
 enum framing { FRAME_NONE, FRAME_LENGTH, FRAME_CHUNKED, FRAME_CLOSE };
 
-/* 응답은 정적·프록시·CGI 모두 이 문을 거쳐서만 나간다.
+/* 응답은 정적·프록시·캐시 모두 이 문을 거쳐서만 나간다.
    약속한 길이를 여기 한 곳에서 세므로, 더 보내거나 덜 보내고도 연결을 유지하는 일이 없다 */
 struct reply {
     int minor;      /* 클라이언트의 HTTP 버전. 1.0에는 chunked를 보내면 안 된다 */
