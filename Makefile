@@ -2,6 +2,7 @@
 # make test       단위 테스트 + 기능 테스트
 # make unit/e2e   각각 따로
 # make asan/tsan  sanitizer 빌드 (build/asan, build/tsan)
+# make bench      부하 측정 (ab, 있으면 wrk)
 # make cgi        CGI 예제 프로그램
 # make clean
 
@@ -31,7 +32,7 @@ OBJS := $(SRCS:src/%.c=$(BUILD)/obj/%.o)
 UNIT_OBJS := $(filter-out $(BUILD)/obj/main.o,$(OBJS)) \
              $(patsubst tests/unit/%.c,$(BUILD)/unit/%.o,$(wildcard tests/unit/*.c))
 
-.PHONY: all cgi unit e2e test fault asan tsan clean
+.PHONY: all cgi bench unit e2e test fault asan tsan clean
 all: $(BUILD)/webserver
 
 # CGI 예제 프로그램
@@ -65,6 +66,9 @@ fault:
 	@$(MAKE) -s BUILD=build/fault EXTRA=-DFAULT_INJECT build/fault/webserver
 
 test: unit e2e
+
+bench: $(BUILD)/webserver cgi
+	WEBSERVER=$(BUILD)/webserver $(PYTHON) tests/bench.py
 
 asan:
 	$(MAKE) BUILD=build/asan OPT=-O1 SAN="-fsanitize=address,undefined -fno-omit-frame-pointer" all build/asan/unit_tests

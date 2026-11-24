@@ -1,3 +1,4 @@
+#include "crash.h"
 #include "health.h"
 #include "log.h"
 #include "net.h"
@@ -14,6 +15,8 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#define FORCE_MS 2000 /* 즉시 종료를 알린 뒤에도 안 끝나는 루프를 기다려 주는 시간 */
 
 static int g_sig_pipe[2];
 
@@ -149,9 +152,27 @@ static int open_log(const struct config *cfg)
     return fd;
 }
 
-/* 메인 스레드가 하는 일: 새 연결 나눠 주기, 시그널, 헬스 체크. 요청 처리는 하지 않는다 */
-static void run(struct server *s, struct config *cfg, int evfd, struct door *doors, int ndoors, int alive_fd)
+/* 모든 루프가 지난번 확인 뒤로 움직였나. 멈춘 루프가 있으면 한 번 알린다 */
+static bool all_moving(struct server *s)
 {
+    bool ok = true;
+    for (int i = 0; i < s->nloops; i++) {
+        struct loop *l = &s->loops[i];
+        unsigned b = atomic_load(&l->beats);
+        bool stuck = b == l->seen_beats;
+        if (stuck && !l->stuck)
+            log_note("루프 %d이(가) 1초 넘게 움직이지 않습니다", i);
+        l->stuck = stuck;
+        l->seen_beats = b;
+        ok = ok && !stuck;
+    }
+    return ok;
+}
+
+/* 메인 스레드가 하는 일: 새 연결 나눠 주기, 시그널, 헬스 체크, 심장 박동. 요청 처리는 하지 않는다 */
+static void run(struct server *s, struct config *cfg, int evfd, struct door *doors, int ndoors, int alive_fd, int beat_fd)
+{
+    long long next_beat = now_ms() + 1000, force_at = 0;
     long long paused_until = 0, kill_at = 0;
     int signals = 0;
     while (signals == 0 || atomic_load(&s->loops_alive) > 0) {
@@ -193,6 +214,17 @@ static void run(struct server *s, struct config *cfg, int evfd, struct door *doo
         if (kill_at && now >= kill_at) {
             kill_at = 0;
             set_phase(s, PHASE_KILL);
+            force_at = now + FORCE_MS;
+        }
+        if (force_at && now >= force_at) {
+            /* 멈춘 루프는 "끝내라"를 듣지 못한다. 기다리면 영원히 끝나지 않는다 */
+            log_note("멈춘 루프가 있어 강제로 끝냅니다");
+            _exit(3);
+        }
+        if (now >= next_beat && signals == 0) {
+            next_beat = now + 1000;
+            if (all_moving(s) && beat_fd >= 0)
+                (void)!write(beat_fd, ".", 1); /* 감독에게: 모두 살아 있다 */
         }
         if (signals == 0)
             health_tick(now);
@@ -263,6 +295,7 @@ int main(int argc, char **argv)
     snprintf(s.via, sizeof s.via, "jiho-webserver-%08x", id);
     s.nloops = cfg->loops ? cfg->loops : (int)sysconf(_SC_NPROCESSORS_ONLN);
     s.loops = calloc((size_t)s.nloops, sizeof *s.loops);
+    crash_install(&s);
     for (int i = 0; i < s.nloops; i++)
         if (!s.loops || loop_start(&s.loops[i], i, &s) < 0) {
             perror("loop_start");
@@ -278,11 +311,9 @@ int main(int argc, char **argv)
         return 1;
     fprintf(stderr, "listening on port %d (loops %d)\n", net_local_port(doors[0].io.fd), s.nloops);
 
-    if (in.ready >= 0) { /* 감독에게: 이제 받을 수 있다. 옛 워커를 내보내도 된다 */
+    if (in.ready >= 0) /* 감독에게: 이제 받을 수 있다. 옛 워커를 내보내도 된다 */
         (void)!write(in.ready, "R", 1);
-        close(in.ready);
-    }
-    run(&s, cfg, evfd, doors, ndoors, in.alive);
+    run(&s, cfg, evfd, doors, ndoors, in.alive, in.ready);
 
     health_stop();
     for (int i = 0; i < s.nloops; i++)

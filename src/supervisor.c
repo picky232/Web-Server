@@ -23,7 +23,14 @@ extern char **environ;
 #define FD_SOURCE 32
 #define ENV_NAME "WEBSERVER_FDS"
 #define MAX_OLD 32
-#define START_LIMIT_MS 30000
+#define START_LIMIT_MS 30000 /* 백엔드 이름 해석이 느릴 수 있어 넉넉히 */
+#define BACKOFF_MAX_MS 30000
+#define GRACE_MS 5000        /* 워커가 스스로 정한 마무리 시간을 넘긴 뒤 더 봐주는 시간 */
+#ifdef FAULT_INJECT
+#define MISS_LIMIT 3 /* 시험이 오래 걸리지 않게 */
+#else
+#define MISS_LIMIT 10
+#endif
 
 struct inherited supervisor_inherit(void)
 {
@@ -58,15 +65,25 @@ static void on_signal(int sig)
     errno = e;
 }
 
+struct worker {
+    pid_t pid;         /* 0 = 없음 */
+    int fd;            /* 워커가 쓰는 파이프. 첫 바이트 = 준비됨, 그 뒤 = 심장 박동 */
+    long long since;   /* 띄운 시각 */
+    long long kill_at; /* 이 시각까지 안 끝나면 강제 종료. 0 = 정하지 않음 */
+};
+
 struct sup {
     char **argv;
     int door[2], ndoors;
     int alive[2];
-    pid_t current, starting, old[MAX_OLD];
+    struct worker current, starting, old[MAX_OLD];
     int nold;
-    int ready_fd;        /* starting 워커의 준비 신호 */
     long long started_at, respawn_at;
     int backoff_ms;
+    int misses;          /* 심장 박동이 연속으로 안 온 횟수 */
+    long long next_tick;
+    bool watch;
+    int grace_ms;        /* 마무리할 시간(timeout_drain) + 여유 */
     bool ever_ready;     /* 한 번이라도 워커가 준비된 적이 있다 */
     bool reload;         /* 새 워커가 뜨는 중에 SIGHUP이 또 왔다 */
     bool stopping;
@@ -126,36 +143,70 @@ static void spawn_worker(struct sup *s)
         close(r);
         return;
     }
-    s->starting = pid;
-    s->ready_fd = r;
-    s->started_at = now_ms();
+    s->starting = (struct worker){.pid = pid, .fd = r, .since = now_ms()};
+    s->started_at = s->starting.since;
 }
 
-/* 다시 띄울 때를 정한다. 거듭 실패하면 간격을 두 배로 늘려 쉬지 않고 되살리느라 CPU를 쓰지 않게 한다 */
+/* 다시 띄울 때를 정한다. 첫 번째는 바로(0.1초), 거듭 실패하면 두 배씩 늘려 쉬지 않고 되살리느라 CPU를 쓰지 않게 한다 */
 static void schedule(struct sup *s)
 {
     bool quick = now_ms() - s->started_at < 5000;
-    s->backoff_ms = !quick || !s->backoff_ms ? 100 : s->backoff_ms < 5000 ? s->backoff_ms * 2 : 5000;
+    s->backoff_ms = !quick || !s->backoff_ms ? 100 : s->backoff_ms * 2 < BACKOFF_MAX_MS ? s->backoff_ms * 2 : BACKOFF_MAX_MS;
     s->respawn_at = now_ms() + s->backoff_ms;
+}
+
+static void tell(struct sup *s, struct worker *w)
+{
+    kill(w->pid, SIGTERM);
+    if (!w->kill_at) /* 멈춘 워커는 SIGTERM을 듣지 못할 수 있다 */
+        w->kill_at = now_ms() + s->grace_ms;
+}
+
+static void drop_fd(struct worker *w)
+{
+    if (w->fd >= 0)
+        close(w->fd);
+    w->fd = -1;
 }
 
 static void on_ready(struct sup *s)
 {
     char b;
-    if (read(s->ready_fd, &b, 1) != 1)
+    if (read(s->starting.fd, &b, 1) != 1)
         return; /* 준비하기 전에 죽었다. SIGCHLD에서 처리한다 */
-    close(s->ready_fd);
-    s->ready_fd = -1;
     s->ever_ready = true;
-    log_note("감독: 워커 %d 준비됨", (int)s->starting);
-    if (s->current) {
+    log_note("감독: 워커 %d 준비됨", (int)s->starting.pid);
+    if (s->current.pid) {
         if (!s->stopping) /* 멈추는 중이면 이미 SIGTERM을 보냈다. 또 보내면 "당장 끝내라"가 된다 */
-            kill(s->current, SIGTERM);
+            tell(s, &s->current);
+        drop_fd(&s->current);
         if (s->nold < MAX_OLD)
             s->old[s->nold++] = s->current;
     }
     s->current = s->starting;
-    s->starting = 0;
+    s->starting = (struct worker){.fd = -1};
+    s->misses = 0;
+    s->respawn_at = 0;
+}
+
+/* 1초에 한 번. 시간이 아니라 "확인했는데 소식이 없던 횟수"를 센다.
+   노트북이 잠들었다 깨면 시간은 훌쩍 지나 있지만, 그동안 감독도 세지 않았으므로 오판하지 않는다 */
+static void tick(struct sup *s)
+{
+    char buf[256];
+    bool heard = s->current.fd >= 0 && read(s->current.fd, buf, sizeof buf) > 0;
+    s->misses = heard ? 0 : s->misses + 1;
+    if (s->misses == MISS_LIMIT)
+        log_note("감독: 워커 %d이(가) %d번 연속 소식이 없습니다. 새 워커로 바꿉니다", (int)s->current.pid, MISS_LIMIT);
+}
+
+static void enforce(struct worker *w)
+{
+    if (!w->pid || !w->kill_at || now_ms() < w->kill_at)
+        return;
+    log_note("감독: 워커 %d을(를) 강제로 끝냅니다", (int)w->pid);
+    kill(w->pid, SIGKILL);
+    w->kill_at = now_ms() + 1000;
 }
 
 static void on_child(struct sup *s)
@@ -163,26 +214,27 @@ static void on_child(struct sup *s)
     int st;
     pid_t pid;
     while ((pid = waitpid(-1, &st, WNOHANG)) > 0) {
-        if (pid == s->starting) {
-            s->starting = 0;
-            if (s->ready_fd >= 0)
-                close(s->ready_fd);
-            s->ready_fd = -1;
-            log_note("감독: 새 워커가 시작하지 못했습니다.%s", s->current ? " 옛 워커를 그대로 둡니다" : "");
+        const char *how = WIFSIGNALED(st) ? "시그널" : "종료 코드";
+        int code = WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st);
+        if (pid == s->starting.pid) {
+            drop_fd(&s->starting);
+            s->starting = (struct worker){.fd = -1};
+            log_note("감독: 새 워커가 시작하지 못했습니다(%s %d).%s", how, code, s->current.pid ? " 옛 워커를 그대로 둡니다" : "");
             if (!s->ever_ready)
                 s->stopping = true; /* 첫 시작부터 실패: 설정이 잘못됐다 */
-            else if (!s->current && !s->stopping)
+            else if (!s->stopping)
                 schedule(s);
-        } else if (pid == s->current) {
-            s->current = 0;
-            if (s->stopping || s->starting) /* 새 워커가 뜨는 중이면 그것이 이어받는다 */
+        } else if (pid == s->current.pid) {
+            drop_fd(&s->current);
+            s->current = (struct worker){.fd = -1};
+            s->misses = 0;
+            if (s->stopping || s->starting.pid) /* 새 워커가 뜨는 중이면 그것이 이어받는다 */
                 continue;
             schedule(s);
-            log_note("감독: 워커 %d이(가) 죽었습니다(%s %d). %dms 뒤 다시 띄웁니다", (int)pid,
-                     WIFSIGNALED(st) ? "시그널" : "종료 코드", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st), s->backoff_ms);
+            log_note("감독: 워커 %d이(가) 죽었습니다(%s %d). %dms 뒤 다시 띄웁니다", (int)pid, how, code, s->backoff_ms);
         } else {
             for (int i = 0; i < s->nold; i++)
-                if (s->old[i] == pid)
+                if (s->old[i].pid == pid)
                     s->old[i] = s->old[--s->nold];
         }
     }
@@ -192,11 +244,11 @@ static void stop_all(struct sup *s)
 {
     /* 마무리 중인 옛 워커는 이미 SIGTERM을 받았다. 두 번째로 멈추라고 할 때만 또 보낸다 */
     for (int i = 0; s->stopping && i < s->nold; i++)
-        kill(s->old[i], SIGTERM);
-    if (s->current)
-        kill(s->current, SIGTERM);
-    if (s->starting)
-        kill(s->starting, SIGTERM);
+        tell(s, &s->old[i]);
+    if (s->current.pid)
+        tell(s, &s->current);
+    if (s->starting.pid)
+        tell(s, &s->starting);
     s->stopping = true;
 }
 
@@ -222,7 +274,9 @@ int supervisor_run(struct config *cfg, char **argv)
     struct sup s;
     memset(&s, 0, sizeof s);
     s.argv = argv;
-    s.ready_fd = -1;
+    s.current.fd = s.starting.fd = -1;
+    s.watch = cfg->watchdog;
+    s.grace_ms = cfg->drain_ms + GRACE_MS;
     if (open_doors(&s, cfg) < 0 || net_pipe(g_pipe) < 0 || pipe(s.alive) < 0)
         return 1;
     s.alive[0] = move_up(s.alive[0]);
@@ -233,43 +287,54 @@ int supervisor_run(struct config *cfg, char **argv)
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;
     const int sigs[] = {SIGHUP, SIGTERM, SIGINT, SIGCHLD};
-    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++)
-        sigaction(sigs[i], &sa, NULL);
-
+    for (size_t k = 0; k < sizeof sigs / sizeof sigs[0]; k++)
+        sigaction(sigs[k], &sa, NULL);
     sa.sa_handler = SIG_IGN; /* 로그를 받던 쪽이 사라져도 감독이 죽지 않게 */
     sigaction(SIGPIPE, &sa, NULL);
 
     log_note("감독 프로세스 %d: 설정을 다시 읽으려면 kill -HUP %d", (int)getpid(), (int)getpid());
     spawn_worker(&s);
-    if (!s.starting)
+    if (!s.starting.pid)
         return 1;
-    while (!s.stopping || s.current || s.starting || s.nold) {
-        struct pollfd p[2] = {{.fd = g_pipe[0], .events = POLLIN}, {.fd = s.ready_fd, .events = POLLIN}};
-        poll(p, 2, s.respawn_at || s.starting ? 50 : -1);
+    while (!s.stopping || s.current.pid || s.starting.pid || s.nold) {
+        struct pollfd p[2] = {{.fd = g_pipe[0], .events = POLLIN}, {.fd = s.starting.fd, .events = POLLIN}};
+        bool soon = s.respawn_at || s.starting.pid || s.nold || s.stopping;
+        poll(p, 2, soon ? 50 : 1000);
         unsigned char sig[32];
         ssize_t n = read(g_pipe[0], sig, sizeof sig);
-        if (s.ready_fd >= 0 && (p[1].revents & POLLIN))
+        if (s.starting.pid && (p[1].revents & POLLIN))
             on_ready(&s);
-        for (ssize_t i = 0; i < n; i++) {
-            if (sig[i] == SIGCHLD)
+        for (ssize_t k = 0; k < n; k++) {
+            if (sig[k] == SIGCHLD)
                 on_child(&s);
-            else if (sig[i] == SIGHUP)
+            else if (sig[k] == SIGHUP)
                 s.reload = true;
             else
                 stop_all(&s);
         }
-        if (s.starting && now_ms() - s.started_at > START_LIMIT_MS)
-            kill(s.starting, SIGKILL); /* 시작하다 멈춘 워커. SIGCHLD에서 정리한다 */
-        if (s.stopping || s.starting)
+        enforce(&s.current);
+        enforce(&s.starting);
+        for (int k = 0; k < s.nold; k++)
+            enforce(&s.old[k]);
+        long long now = now_ms();
+        if (s.starting.pid && !s.starting.kill_at && now - s.starting.since > START_LIMIT_MS)
+            s.starting.kill_at = now; /* 시작하다 멈춘 워커 */
+        if (s.current.pid && now >= s.next_tick) {
+            s.next_tick = now + 1000;
+            if (s.watch && !s.stopping)
+                tick(&s);
+        }
+        if (s.stopping || s.starting.pid)
             continue;
-        if (s.reload && s.current) { /* 뜨는 중에 온 SIGHUP도 여기서 이어서 처리된다 */
+        bool hung = s.watch && s.current.pid && s.misses >= MISS_LIMIT;
+        bool reload = s.reload && s.current.pid; /* 뜨는 중에 온 SIGHUP도 여기서 이어서 처리된다 */
+        if (reload || ((hung || !s.current.pid) && now >= s.respawn_at)) {
+            if (reload)
+                log_note("감독: 새 설정으로 워커를 띄웁니다");
             s.reload = false;
-            log_note("감독: 새 설정으로 워커를 띄웁니다");
-            spawn_worker(&s);
-        } else if (!s.current && s.respawn_at && now_ms() >= s.respawn_at) {
             s.respawn_at = 0;
             spawn_worker(&s);
-            if (!s.starting) /* 실행 파일 교체 중이거나 프로세스 한도. 포기하지 않고 다시 */
+            if (!s.starting.pid) /* 실행 파일 교체 중이거나 프로세스 한도. 포기하지 않고 다시 */
                 schedule(&s);
         }
     }

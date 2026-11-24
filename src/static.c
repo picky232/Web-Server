@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -28,6 +29,10 @@ int open_under(int root_fd, const char *rel, struct stat *st)
     int dir = root_fd;
 #ifdef FAULT_INJECT /* 시험 빌드 전용: 좀처럼 나지 않는 실패를 일부러 낸다 */
     if (!strncmp(rel, "/__fault/", 9)) {
+        while (!strcmp(rel + 9, "hang"))
+            sleep(1000); /* 루프 스레드가 멈춘 상황 */
+        if (!strcmp(rel + 9, "crash"))
+            abort();
         errno = !strcmp(rel + 9, "emfile") ? EMFILE : EIO;
         return -1;
     }

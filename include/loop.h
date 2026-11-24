@@ -45,6 +45,10 @@ struct loop {
     atomic_llong by_class[6]; /* 1xx~5xx, 0 = 응답 전에 떠남 */
     atomic_llong max_busy_us; /* 한 바퀴가 가장 오래 걸린 시간: 그동안 다른 연결은 기다렸다 */
     long long now;       /* 이번 바퀴의 시각 */
+    unsigned seen_beats; /* 메인 스레드만 쓴다: 지난번에 본 값 */
+    bool stuck;          /* 메인 스레드만 쓴다 */
+    atomic_uint beats;   /* 돌 때마다 +1. 쉬어도 0.25초에 한 번은 돈다 → 안 늘면 멈춘 것 */
+    _Atomic(struct conn *) current; /* 지금 진행 중인 연결 (죽을 때 기록용) */
     long long next_scan;
     bool draining, quit;
 };

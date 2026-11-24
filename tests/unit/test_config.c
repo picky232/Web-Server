@@ -45,10 +45,13 @@ void test_config(void)
     const char *bad[] = {"listen", "listen 8080", "listen a b", "nope 1", "max_body 1x", "max_body -1", "timeout_head 10",
                          "timeout_head 0s", "loops 0", "loops x", "pool a 127.0.0.1:9", "pool", "pool z", "pool z 127.0.0.1",
                          "pool z max=0 127.0.0.1:1", "route * /x proxy none", "route * x proxy a", "route * /x nope a",
-                         "route * /x static /no/such/dir", "route * /x"};
+                         "route * /x static /no/such/dir", "route * /x", "route * /x proxy a nope", "route * /x proxy a cookies", "watchdog maybe", "forward 127.0.0.1:1"};
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++)
         CHECK_MSG(!line(c, bad[i]), bad[i]);
 
+    CHECK(line(c, "route * /zz1 proxy a cache cookies") && c->routes[c->nroutes - 1].cache && c->routes[c->nroutes - 1].cache_cookies);
+    CHECK(line(c, "route * /zz2 proxy a cache") && c->routes[c->nroutes - 1].cache && !c->routes[c->nroutes - 1].cache_cookies);
+    CHECK(line(c, "watchdog off") && !c->watchdog);
     CHECK(line(c, "route * /api/ proxy a"));
     CHECK(line(c, "route * /api/v2 proxy b"));
     CHECK(line(c, "route Admin.Localhost / proxy host"));

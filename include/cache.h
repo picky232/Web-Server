@@ -38,7 +38,8 @@ void cached_unref(struct cached *o);
 void cache_stats(struct cache *c, long long *hits, long long *misses, long long *bytes, long long *count);
 
 /* 순수 판정 함수 */
-bool cache_may_lookup(const struct http_req *r);
-long long cache_fresh_ms(const struct http_req *r, const struct http_res *s, long long *age_ms); /* 0 = 저장하지 않음 */
+/* cookies: 쿠키가 있는 요청도 허용하는 경로인가 */
+bool cache_may_lookup(const struct http_req *r, bool cookies);
+long long cache_fresh_ms(const struct http_req *r, const struct http_res *s, bool cookies, long long *age_ms); /* 0 = 저장하지 않음 */
 
 #endif

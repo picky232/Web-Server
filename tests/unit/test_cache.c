@@ -7,7 +7,7 @@ static bool req(const char *s, struct http_req *r)
 {
     char b[512];
     snprintf(b, sizeof b, "GET / HTTP/1.1\r\nHost: x\r\n%s\r\n", s);
-    return http_parse_request(b, strlen(b), r) == 0 && cache_may_lookup(r);
+    return http_parse_request(b, strlen(b), r) == 0 && cache_may_lookup(r, false);
 }
 
 static long long fresh(const char *method, const char *status, const char *headers)
@@ -20,7 +20,7 @@ static long long fresh(const char *method, const char *status, const char *heade
     snprintf(b, sizeof b, "HTTP/1.1 %s OK\r\n%s\r\n", status, headers);
     if (http_parse_request(a, strlen(a), &r) || !http_parse_response(b, strlen(b), &s))
         return -1;
-    return cache_fresh_ms(&r, &s, &age);
+    return cache_fresh_ms(&r, &s, false, &age);
 }
 
 static struct cached *obj(const char *key, size_t body, long long now, long long fresh_ms)
@@ -51,6 +51,15 @@ void test_cache(void)
                         "Content-Length: 3\r\n", "Transfer-Encoding: chunked\r\n"};
     for (size_t i = 0; i < sizeof no / sizeof no[0]; i++)
         CHECK_MSG(!req(no[i], r), no[i]);
+    /* 쿠키를 허용한 경로에서도 나머지는 그대로 막는다 */
+    char ck[] = "GET / HTTP/1.1\r\nHost: x\r\nCookie: a\r\n\r\n", au[] = "GET / HTTP/1.1\r\nHost: x\r\nCookie: a\r\nAuthorization: b\r\n\r\n";
+    CHECK(http_parse_request(ck, strlen(ck), r) == 0 && cache_may_lookup(r, true) && !cache_may_lookup(r, false));
+    static struct http_res sc;
+    const char *set = "HTTP/1.1 200 OK\r\nCache-Control: max-age=9\r\nSet-Cookie: s=1\r\n\r\n", *plain = "HTTP/1.1 200 OK\r\nCache-Control: max-age=9\r\n\r\n";
+    long long age0;
+    CHECK(http_parse_response(plain, strlen(plain), &sc) && cache_fresh_ms(r, &sc, true, &age0) == 9000 && cache_fresh_ms(r, &sc, false, &age0) == 0);
+    CHECK(http_parse_response(set, strlen(set), &sc) && cache_fresh_ms(r, &sc, true, &age0) == 0);
+    CHECK(http_parse_request(au, strlen(au), r) == 0 && !cache_may_lookup(r, true));
     free(r);
 
     CHECK(fresh("GET", "200", "Cache-Control: max-age=60\r\n") == 60000);

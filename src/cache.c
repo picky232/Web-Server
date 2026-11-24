@@ -200,12 +200,12 @@ void cache_free(struct cache *c)
 
 /* ---- 판정 ---- */
 
-bool cache_may_lookup(const struct http_req *r)
+bool cache_may_lookup(const struct http_req *r, bool cookies)
 {
-    static const char *const no[] = {"Authorization", "Cookie", "Range"}; /* 손님마다 답이 다를 수 있다 */
+    static const char *const no[] = {"Authorization", "Range", "Cookie"}; /* 손님마다 답이 다를 수 있다 */
     if ((r->method != M_GET && r->method != M_HEAD) || r->chunked || r->length > 0)
         return false; /* 본문이 있는 GET은 본문에 따라 답이 다를 수 있는데, 본문은 키에 없다 */
-    for (size_t i = 0; i < sizeof no / sizeof no[0]; i++)
+    for (size_t i = 0; i < sizeof no / sizeof no[0] - cookies; i++)
         if (fields_find(&r->h, no[i]))
             return false;
     return !fields_token(&r->h, "Cache-Control", "no-store") && !fields_token(&r->h, "Cache-Control", "no-cache") &&
@@ -234,9 +234,9 @@ static long long seconds_of(const struct fields *h, const char *name)
     return -1;
 }
 
-long long cache_fresh_ms(const struct http_req *r, const struct http_res *s, long long *age_ms)
+long long cache_fresh_ms(const struct http_req *r, const struct http_res *s, bool cookies, long long *age_ms)
 {
-    if (r->method != M_GET || s->status != 200 || !cache_may_lookup(r))
+    if (r->method != M_GET || s->status != 200 || !cache_may_lookup(r, cookies))
         return 0;
     static const char *const tokens[] = {"no-store", "no-cache", "private", "must-understand"};
     for (size_t i = 0; i < sizeof tokens / sizeof tokens[0]; i++)

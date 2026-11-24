@@ -41,7 +41,7 @@ void caching_drop(struct proxy_st *px)
 void caching_begin(struct conn *c, const struct http_res *res, const struct buf *extra, unsigned flags)
 {
     struct proxy_st *px = &c->ex->u.proxy;
-    long long age = 0, fresh = caching_on(c) ? cache_fresh_ms(&c->ex->req, res, &age) : 0;
+    long long age = 0, fresh = caching_on(c) ? cache_fresh_ms(&c->ex->req, res, c->ex->route->cache_cookies, &age) : 0;
     if (!fresh || res->length > CACHE_OBJECT_MAX)
         return;
     struct cached *o = calloc(1, sizeof *o);
@@ -146,7 +146,7 @@ bool caching_lookup(struct conn *c)
     if (!key)
         return false;
     px->cache_gen = cache_generation(cache, key);
-    struct cached *o = cache_may_lookup(&c->ex->req) ? cache_get(cache, key, c->loop->now) : NULL;
+    struct cached *o = cache_may_lookup(&c->ex->req, c->ex->route->cache_cookies) ? cache_get(cache, key, c->loop->now) : NULL;
     free(key);
     if (o)
         serve(c, o);

@@ -802,6 +802,24 @@ class Cache(ProxyCase):
         self.assertEqual(s.get("/a?x", method="POST", body=b"z")[0], 200)  # 값을 바꾸는 요청이 성공하면 지운다
         self.assertEqual(s.get("/a?x")[1]["x-cache"], "MISS")
 
+    def test_cookie_exception_is_per_route(self):
+        self.n = 0
+
+        def script(sock, head, b):
+            self.n += 1
+            data = b"v%d" % self.n
+            sock.sendall(b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: %d\r\n\r\n" % len(data) + data)
+        s = self.up(script, route="route * /open proxy p cache cookies\nroute * / proxy p cache\n")
+        ck = [("Cookie", "session=1")]
+        self.assertEqual([s.get("/open", headers=ck)[1]["x-cache"] for _ in range(2)], ["MISS", "HIT"])
+        self.assertEqual([s.get("/shut", headers=ck)[1]["x-cache"] for _ in range(2)], ["MISS", "MISS"])
+        self.assertEqual(s.get("/open", headers=ck + [("Authorization", "x")])[1]["x-cache"], "MISS")
+        for path in ("/open", "/shut"):  # 쿠키가 있어도 지우기는 항상 한다 (수정은 보통 로그인한 사람이 한다)
+            s.get(path)
+            self.assertEqual(s.get(path)[1]["x-cache"], "HIT")
+            s.get(path, method="PUT", headers=ck, body=b"x")
+            self.assertEqual(s.get(path)[1]["x-cache"], "MISS")
+
     def test_private_responses_are_never_stored(self):
         for extra in (b"", b"Cache-Control: private, max-age=60\r\n", b"Cache-Control: max-age=60\r\nSet-Cookie: s=1\r\n",
                       b"Cache-Control: max-age=60\r\nVary: Cookie\r\n", b"Cache-Control: no-store\r\n"):
@@ -1290,6 +1308,112 @@ class Limits(unittest.TestCase):
         self.assertEqual(s.get("/")[0], 200)
         for c in cs:
             c.close()
+
+
+@unittest.skipUnless(os.environ.get("FAULT"), "고장 주입 빌드에서만 (make e2e가 켠다)")
+class Watchdog(unittest.TestCase):
+    """감독이 워커의 죽음과 멈춤을 알아채고 바꾸는지. 일부러 멈추거나 죽는 주소(/__fault/...)를 쓴다"""
+
+    def start(self, conf="", supervise=True):
+        self.d = tempfile.mkdtemp(prefix="webserver-dog-")
+        self.port = free_port()
+        path = Path(self.d, "c.conf")
+        path.write_text(f"listen 127.0.0.1:{self.port}\nloops 2\naccess_log off\ntimeout_drain 500ms\nroute * / static {ROOT}/www\n{conf}")
+        self.err = open(Path(self.d, "err"), "w+")
+        cmd = [str(ROOT / os.environ["FAULT"]), "-c", str(path)] + (["-s"] if supervise else [])
+        self.p = subprocess.Popen(cmd, stderr=self.err)
+        self.wait(lambda: self.get() == 200)
+
+    def tearDown(self):
+        if self.p.poll() is None:
+            self.p.kill()
+            self.p.wait()
+        self.err.close()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def text(self):
+        return Path(self.d, "err").read_text()
+
+    def get(self, path="/", timeout=1):
+        try:
+            c = socket.create_connection(("127.0.0.1", self.port), timeout)
+            c.settimeout(timeout)
+            c.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+            return int(c.recv(100).split()[1])
+        except (OSError, IndexError, ValueError):
+            return None
+
+    def wait(self, f, limit=15):
+        end = time.time() + limit
+        while time.time() < end:
+            if f():
+                return
+            time.sleep(0.05)
+        self.fail(self.text())
+
+    def workers(self):
+        return [int(x) for x in subprocess.run(["pgrep", "-P", str(self.p.pid)], capture_output=True).stdout.split()]
+
+    def test_hung_loop_is_replaced(self):
+        self.start()
+        old = self.workers()[0]
+        self.get("/__fault/hang", timeout=0.2)
+        self.wait(lambda: "소식이 없습니다" in self.text() and any(w != old for w in self.workers()))
+        self.wait(lambda: self.get() == 200)
+        self.assertIn("움직이지 않습니다", self.text())
+        self.wait(lambda: self.workers() and old not in self.workers())  # 멈춘 워커는 SIGTERM을 못 들어도 결국 사라진다
+        self.assertEqual([self.get() for _ in range(10)], [200] * 10)
+
+    def test_frozen_worker_is_replaced(self):
+        self.start()
+        old = self.workers()[0]
+        os.kill(old, signal.SIGSTOP)  # 메인까지 통째로 멈춤
+        self.wait(lambda: self.workers() and old not in self.workers())
+        self.wait(lambda: self.get() == 200)
+
+    def test_frozen_supervisor_does_not_misjudge(self):
+        # 감독과 워커가 같이 잠들었다 깨는 상황(노트북 덮기): 시간만 지났다고 바꾸면 안 된다
+        self.start()
+        w = self.workers()[0]
+        for pid in (self.p.pid, w):
+            os.kill(pid, signal.SIGSTOP)
+        time.sleep(5)
+        for pid in (w, self.p.pid):
+            os.kill(pid, signal.SIGCONT)
+        time.sleep(2)
+        self.assertEqual(self.workers(), [w])
+        self.assertEqual(self.get(), 200)
+
+    def test_watchdog_off(self):
+        self.start("watchdog off\n")
+        w = self.workers()[0]
+        os.kill(w, signal.SIGSTOP)
+        time.sleep(5)
+        self.assertEqual(self.workers(), [w])
+        os.kill(w, signal.SIGCONT)
+        self.wait(lambda: self.get() == 200)
+
+    def test_crash_leaves_a_record_and_comes_back(self):
+        self.start()
+        w = self.workers()[0]
+        self.get("/__fault/crash?token=secret")
+        self.wait(lambda: self.workers() and self.workers()[0] != w and self.get() == 200)
+        t = self.text()
+        self.assertRegex(t, r"처리 중이던 요청: 루프 \d GET /__fault/crash")
+        self.assertRegex(t, r"죽었습니다\(시그널 6\)")
+        self.assertNotIn("secret", t)
+
+    def test_stopping_with_a_hung_loop_still_ends(self):
+        for supervise in (True, False):
+            self.start("watchdog off\n", supervise)
+            self.get("/__fault/hang", timeout=0.2)
+            t = time.time()
+            self.p.terminate()
+            self.p.wait(12)  # 예전에는 멈춘 루프를 영원히 기다렸다
+            self.assertLess(time.time() - t, 10)
+            self.assertIn("강제로 끝냅니다", self.text())
+            self.tearDown()
+        self.start()
 
 
 @unittest.skipUnless(os.environ.get("FAULT"), "고장 주입 빌드에서만 (make e2e가 켠다)")

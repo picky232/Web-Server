@@ -26,6 +26,7 @@ void config_defaults(struct config *c)
     c->drain_ms = 10000;
     c->cgi_ms = 10000;
     c->health_ms = 2000;
+    c->watchdog = true;
     strcpy(c->access_log, "-");
 }
 
@@ -131,7 +132,7 @@ static bool open_dir(struct route *r, const char *dir, char *err, size_t cap)
     return true;
 }
 
-/* route 호스트 접두사 static 폴더 | proxy 묶음 [cache] | cgi 폴더 */
+/* route 호스트 접두사 static 폴더 | proxy 묶음 [cache [cookies]] | cgi 폴더 */
 static bool parse_route(struct config *c, char **t, int n, char *err, size_t cap)
 {
     if (n < 5)
@@ -162,7 +163,14 @@ static bool parse_route(struct config *c, char **t, int n, char *err, size_t cap
         r->pool = find_pool(c, t[4]);
         if (!r->pool)
             return fail(err, cap, "route: 없는 pool입니다: %s (pool 줄을 먼저 적으세요)", t[4]);
-        r->cache = n > 5 && !strcmp(t[5], "cache");
+        for (int i = 5; i < n; i++) {
+            if (!strcmp(t[i], "cache"))
+                r->cache = true;
+            else if (!strcmp(t[i], "cookies") && r->cache)
+                r->cache_cookies = true;
+            else
+                return fail(err, cap, "route: 모르는 옵션입니다: %s (cache, cache cookies)", t[i]);
+        }
     } else {
         return fail(err, cap, "route: 모르는 동작입니다: %s", t[3]);
     }
@@ -229,6 +237,9 @@ bool config_line(struct config *c, char *line, char *err, size_t cap)
     } else if (!strcmp(t[0], "min_rate")) {
         ok = parse_size(t[1], 1, 1 << 30, &v);
         c->min_rate = (int)v;
+    } else if (!strcmp(t[0], "watchdog")) {
+        ok = !strcmp(t[1], "on") || !strcmp(t[1], "off");
+        c->watchdog = !strcmp(t[1], "on");
     } else if (!strcmp(t[0], "access_log")) {
         ok = strlen(t[1]) < sizeof c->access_log;
         if (ok)

@@ -15,6 +15,7 @@ struct route {
     char dir[512];
     struct pool *pool;  /* proxy */
     bool cache;
+    bool cache_cookies; /* 쿠키가 있는 요청도 캐시를 쓴다. 모두에게 같은 응답인 경로에만 */
 };
 
 /* 시작할 때 한 번 채우고 그 뒤로는 읽기만 한다 → 모든 스레드가 락 없이 같이 쓴다 */
@@ -22,6 +23,7 @@ struct config {
     struct addr listen, admin;
     bool has_admin;
     bool supervise; /* -s: 감독 프로세스로 실행 */
+    bool watchdog;  /* 감독이 워커의 멈춤까지 감시하나 (디버거로 멈춰 둘 때는 끈다) */
     int loops; /* 0 = 코어 수 */
     int max_connections;
     long long max_body, max_disk, cache_size;

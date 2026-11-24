@@ -222,10 +222,12 @@ static void update_interest(struct conn *c)
 
 void conn_run(struct conn *c)
 {
+    struct loop *l = c->loop;
+    atomic_store_explicit(&l->current, c, memory_order_relaxed);
     bool moved = true;
     for (int i = 0; moved && c->state != CS_DEAD; i++) {
         if (i == RUN_BUDGET) { /* 아직 할 일이 있지만 다른 연결도 돌봐야 한다 */
-            loop_ready(c->loop, c);
+            loop_ready(l, c);
             break;
         }
         fill(c);
@@ -241,6 +243,7 @@ void conn_run(struct conn *c)
         destroy(c);
     else
         update_interest(c);
+    atomic_store_explicit(&l->current, NULL, memory_order_relaxed);
 }
 
 /* 두 가지를 같이 본다.

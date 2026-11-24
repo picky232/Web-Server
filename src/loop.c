@@ -1,6 +1,7 @@
 #include "loop.h"
 #include "cgi.h"
 #include "conn.h"
+#include "crash.h"
 #include "log.h"
 #include "server.h"
 #include "str.h"
@@ -95,7 +96,9 @@ static void *loop_main(void *arg)
 {
     struct loop *l = arg;
     struct ev_event ev[MAX_EVENTS];
+    void *stack = crash_thread_begin();
     while (!l->quit) {
+        atomic_fetch_add_explicit(&l->beats, 1, memory_order_relaxed);
         /* 루프 스레드가 잠드는 곳은 프로그램 전체에서 이 한 줄뿐이다 */
         int n = ev_wait(l->evfd, ev, MAX_EVENTS, l->ready ? 0 : l->reaping ? REAP_MS : SCAN_MS);
         long long woke = now_us();
@@ -142,6 +145,7 @@ static void *loop_main(void *arg)
     reap_dead(l);
     log_flush(l);
     buf_free(&l->log);
+    crash_thread_end(stack);
     atomic_fetch_sub(&l->srv->loops_alive, 1);
     return NULL;
 }
