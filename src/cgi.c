@@ -261,7 +261,7 @@ static void cgi_start(struct conn *c)
     s->child = ch;
     s->touched = c->loop->now;
     ex->deadline = c->loop->now + srv->cfg->cgi_ms;
-    snprintf(ex->served_by, sizeof ex->served_by, "cgi:%s", script);
+    snprintf(ex->served_by, sizeof ex->served_by, "cgi:%.80s", script);
 }
 
 size_t cgi_head_end(const char *p, size_t n)

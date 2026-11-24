@@ -24,6 +24,16 @@ void net_nodelay(int fd)
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 }
 
+void net_ack_now(int fd)
+{
+#ifdef TCP_QUICKACK
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof one);
+#else
+    (void)fd;
+#endif
+}
+
 static bool resolve(const char *host, const char *port, struct addr *out)
 {
     struct addrinfo hints, *res;

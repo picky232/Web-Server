@@ -429,7 +429,8 @@ static bool proxy_pump(struct conn *c)
     moved |= send_request(c);
     if (c->state != CS_RESPOND || px->up != up)
         return true;
-    moved |= recv_response(c);
+    bool got = recv_response(c);
+    moved |= got;
     if (!px->head_done)
         moved |= read_head(c);
     if (c->state != CS_RESPOND || px->up != up)
@@ -438,6 +439,10 @@ static bool proxy_pump(struct conn *c)
         moved |= relay_body(c);
     if (c->state != CS_RESPOND || px->up != up)
         return true;
+    /* 머리와 본문을 따로 보내는 백엔드는 앞 조각의 확인 응답을 기다린 뒤에야 나머지를 보낸다.
+       Linux는 그 확인을 40ms까지 미루므로, 더 올 것이 있으면 바로 확인해 준다 */
+    if (got)
+        net_ack_now(up->io.fd);
     if (!px->head_done) {
         ex->deadline = px->touched + cfg->response_ms;
     } else if (reply_room(&ex->reply, &c->out) == 0) {

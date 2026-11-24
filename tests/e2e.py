@@ -388,12 +388,13 @@ class Backend:
             s.close()
 
     def stop(self):
-        self.ls.close()
-        for s in self.socks:
+        # Linux에서는 다른 스레드가 accept·recv 중이면 close만으로 닫히지 않는다. shutdown으로 먼저 깨운다
+        for s in [self.ls, *self.socks]:
             try:
-                s.close()
+                s.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+            s.close()
 
 
 def ok(body=b"ok", extra=b""):
@@ -583,6 +584,20 @@ class ProxyRelay(ProxyCase):
         c.close()
         if "asan" not in BIN and "tsan" not in BIN:
             self.assertLess(rss, 30_000, "KB")
+
+    def test_backend_that_sends_head_and_body_apart_is_not_slow(self):
+        # Linux에서 요청마다 40ms씩 늦던 문제 (확인 응답 미루기)
+        s = self.up(send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", b"ok"), extra="loops 1\n")
+        c = socket.create_connection(("127.0.0.1", s.port))
+        c.settimeout(5)
+        t = time.time()
+        for _ in range(40):
+            c.sendall(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+            out = b""
+            while not out.endswith(b"ok"):
+                out += c.recv(4096)
+        c.close()
+        self.assertLess(time.time() - t, 0.8)
 
     def test_concurrent_bodies_do_not_mix(self):
         s = self.up(lambda sock, head, body: sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body),

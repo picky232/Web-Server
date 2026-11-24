@@ -21,7 +21,7 @@
 void loop_watch(struct loop *l, struct io *io, unsigned want)
 {
     if (!io->dead && want != io->want && ev_set(l->evfd, io, want) < 0)
-        perror("ev_set");
+        log_note("ev_set: %s", strerror(errno));
 }
 
 void loop_bury(struct loop *l, struct io *io)

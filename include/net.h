@@ -21,6 +21,7 @@ int net_pipe(int p[2]);                               /* 안 기다리는 파이
 int net_pipe_for_child(int p[2]);                     /* 읽는 쪽만 안 기다림. 자식이 쓰는 쪽은 평범한 파이프 */
 int net_nonblock(int fd);                             /* O_NONBLOCK + FD_CLOEXEC */
 void net_nodelay(int fd);
+void net_ack_now(int fd); /* 받은 것의 확인 응답을 미루지 않고 바로 보낸다 (Linux) */
 
 void net_ip(const struct addr *a, char *out, size_t cap);
 int net_port(const struct addr *a);

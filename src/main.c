@@ -106,7 +106,7 @@ static void plan_fds(struct config *cfg)
         rl = want;
     if (rl.rlim_cur < need) {
         int fit = rl.rlim_cur > 320 ? (int)((rl.rlim_cur - 256) / 2) : 16;
-        fprintf(stderr, "fd 한도 %llu: max_connections를 %d에서 %d로 줄입니다\n",
+        log_note("fd 한도 %llu: max_connections를 %d에서 %d로 줄입니다",
                 (unsigned long long)rl.rlim_cur, cfg->max_connections, fit);
         cfg->max_connections = fit;
     }
@@ -132,7 +132,7 @@ static bool open_door(struct door *d, const struct addr *a, int origin, int give
         char ip[64];
         int e = errno;
         net_ip(a, ip, sizeof ip);
-        fprintf(stderr, "%s 포트 %d: listen 실패: %s\n", ip, net_port(a), strerror(e));
+        log_note("%s 포트 %d: listen 실패: %s", ip, net_port(a), strerror(e));
         return false;
     }
     d->io = (struct io){.fd = fd, .kind = IO_LISTEN};
@@ -231,6 +231,12 @@ static void run(struct server *s, struct config *cfg, int evfd, struct door *doo
     }
 }
 
+static int quit(struct config *cfg, int code)
+{
+    config_free(cfg);
+    return code;
+}
+
 int main(int argc, char **argv)
 {
     /* 0~2번이 비어 있으면 소켓이 그 번호를 받아, 오류 메시지가 손님에게 나갈 수 있다 */
@@ -243,10 +249,8 @@ int main(int argc, char **argv)
         return 1;
     config_defaults(cfg);
     int rc = config_args(cfg, argc, argv);
-    if (rc) {
-        config_free(cfg);
-        return rc == 1 ? 0 : rc;
-    }
+    if (rc)
+        return quit(cfg, rc == 1 ? 0 : rc);
     struct inherited in = supervisor_inherit();
     if (cfg->supervise && !in.n)
         return supervisor_run(cfg, argv);
@@ -262,16 +266,16 @@ int main(int argc, char **argv)
     }
     struct door doors[2];
     if (in.n && in.n != ndoors) {
-        fprintf(stderr, "admin을 더하거나 빼려면 감독 프로세스를 다시 시작해야 합니다\n");
-        return 2;
+        log_note("admin을 더하거나 빼려면 감독 프로세스를 다시 시작해야 합니다");
+        return quit(cfg, 2);
     }
     for (int k = 0; k < ndoors; k++) {
         if (!open_door(&doors[k], want[k], origins[k], in.n ? in.fd[k] : -1))
-            return 1;
+            return quit(cfg, 1);
         if (in.n && !net_is_bound_to(in.fd[k], want[k])) {
             /* 소켓은 옛 주소 그대로인데 설정만 바뀐 채로 뜨면, 접근 제한을 새 주소 기준으로 잘못 판단한다 */
-            fprintf(stderr, "포트 %d: listen 주소를 바꾸려면 감독 프로세스를 다시 시작해야 합니다\n", net_port(want[k]));
-            return 2;
+            log_note("포트 %d: listen 주소를 바꾸려면 감독 프로세스를 다시 시작해야 합니다", net_port(want[k]));
+            return quit(cfg, 2);
         }
     }
 
@@ -299,7 +303,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < s.nloops; i++)
         if (!s.loops || loop_start(&s.loops[i], i, &s) < 0) {
             perror("loop_start");
-            return 1;
+            return quit(cfg, 1);
         }
 
     int evfd = ev_open();
@@ -308,8 +312,8 @@ int main(int argc, char **argv)
     for (int k = 0; k < ndoors; k++)
         ev_set(evfd, &doors[k].io, IO_R);
     if (health_start(cfg, evfd) < 0)
-        return 1;
-    fprintf(stderr, "listening on port %d (loops %d)\n", net_local_port(doors[0].io.fd), s.nloops);
+        return quit(cfg, 1);
+    log_note("listening on port %d (loops %d)", net_local_port(doors[0].io.fd), s.nloops);
 
     if (in.ready >= 0) /* 감독에게: 이제 받을 수 있다. 옛 워커를 내보내도 된다 */
         (void)!write(in.ready, "R", 1);
@@ -325,6 +329,6 @@ int main(int argc, char **argv)
     if (s.log_fd > 2)
         close(s.log_fd);
     config_free(cfg);
-    fprintf(stderr, "shutdown complete\n");
+    log_note("shutdown complete"); /* 로그를 받는 쪽이 막혀 있어도 종료가 멈추지 않게 */
     return 0;
 }

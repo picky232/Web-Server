@@ -101,7 +101,7 @@ static void spawn_worker(struct sup *s)
 {
     int rp[2];
     if (pipe(rp) < 0) {
-        perror("pipe");
+        log_note("감독: pipe: %s", strerror(errno));
         return;
     }
     int r = move_up(rp[0]), w = move_up(rp[1]);
@@ -261,7 +261,7 @@ static int open_doors(struct sup *s, const struct config *cfg)
     for (int i = 0; i < n; i++) {
         int fd = net_listen(a[i]);
         if (fd < 0) {
-            fprintf(stderr, "포트 %d: listen 실패: %s\n", net_port(a[i]), strerror(errno));
+            log_note("포트 %d: listen 실패: %s", net_port(a[i]), strerror(errno));
             return -1;
         }
         s->door[s->ndoors++] = move_up(fd);
@@ -277,11 +277,12 @@ int supervisor_run(struct config *cfg, char **argv)
     s.current.fd = s.starting.fd = -1;
     s.watch = cfg->watchdog;
     s.grace_ms = cfg->drain_ms + GRACE_MS;
-    if (open_doors(&s, cfg) < 0 || net_pipe(g_pipe) < 0 || pipe(s.alive) < 0)
+    bool ok = open_doors(&s, cfg) == 0 && net_pipe(g_pipe) == 0 && pipe(s.alive) == 0;
+    config_free(cfg);
+    if (!ok)
         return 1;
     s.alive[0] = move_up(s.alive[0]);
     s.alive[1] = move_up(s.alive[1]);
-    config_free(cfg);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
