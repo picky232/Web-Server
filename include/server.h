@@ -1,10 +1,12 @@
 #ifndef SERVER_H
 #define SERVER_H
 
+#include "config.h"
 #include "loop.h"
 
 /* 서버 프로그램 전체. 시작할 때 채우고 그 뒤로는 atomic만 바뀐다 */
 struct server {
+    const struct config *cfg;
     struct loop *loops;
     int nloops;
     atomic_bool draining;

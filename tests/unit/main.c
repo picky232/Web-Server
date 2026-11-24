@@ -10,6 +10,7 @@ int main(void)
     test_uri();
     test_reply();
     test_spool();
+    test_config();
     printf("단위 테스트: %d개 검사, %d개 실패\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

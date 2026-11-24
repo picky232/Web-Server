@@ -7,7 +7,13 @@
 #include "spool.h"
 #include "uri.h"
 
+struct static_st {
+    int fd;
+    long long off, left;
+};
+
 struct conn;
+struct route;
 
 /* 응답을 만들어 내는 쪽의 공통 모양. 정적 파일·백엔드 중계·CGI·상태 페이지가 이 함수들만 채우면 된다.
    새 기능(캐시, 포워드 프록시)도 여기에 하나 더 끼우는 것으로 끝난다 */
@@ -31,10 +37,14 @@ struct exchange {
     struct body_dec dec;
     struct spool body;
     bool sent_100;
+    const struct route *route;
     const struct handler *h;
     struct reply reply;
     long long start_ms;
     long long deadline; /* 핸들러가 정한 제한 시각. 0 = 없음 */
+    union {
+        struct static_st file;
+    } u; /* 핸들러별 상태 */
 };
 
 bool exchange_head(struct conn *c);    /* 요청 머리를 읽고 어떻게 처리할지 결정 */

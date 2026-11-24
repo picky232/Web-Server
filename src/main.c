@@ -64,28 +64,34 @@ static void accept_some(struct server *s, int lfd, int origin)
 
 int main(int argc, char **argv)
 {
-    const char *where = argc > 1 ? argv[1] : "127.0.0.1:8080";
-    struct addr a;
-    if (!net_parse_addr(where, &a)) {
-        fprintf(stderr, "주소를 읽을 수 없습니다: %s\n", where);
-        return 2;
+    struct config *cfg = malloc(sizeof *cfg);
+    if (!cfg)
+        return 1;
+    config_defaults(cfg);
+    int rc = config_args(cfg, argc, argv);
+    if (rc) {
+        config_free(cfg);
+        return rc == 1 ? 0 : rc;
     }
     setup_signals();
-    int lfd = net_listen(&a);
+    int lfd = net_listen(&cfg->listen);
     if (lfd < 0) {
-        fprintf(stderr, "%s: listen 실패: %s\n", where, strerror(errno));
+        char ip[64];
+        net_ip(&cfg->listen, ip, sizeof ip);
+        fprintf(stderr, "%s 포트 %d: listen 실패: %s\n", ip, net_port(&cfg->listen), strerror(errno));
         return 1;
     }
     struct server s;
     memset(&s, 0, sizeof s);
-    s.nloops = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    s.cfg = cfg;
+    s.nloops = cfg->loops ? cfg->loops : (int)sysconf(_SC_NPROCESSORS_ONLN);
     s.loops = calloc((size_t)s.nloops, sizeof *s.loops);
     for (int i = 0; i < s.nloops; i++)
         if (!s.loops || loop_start(&s.loops[i], i, &s) < 0) {
             perror("loop_start");
             return 1;
         }
-    fprintf(stderr, "listening on %s (port %d, loops %d)\n", where, net_local_port(lfd), s.nloops);
+    fprintf(stderr, "listening on port %d (loops %d)\n", net_local_port(lfd), s.nloops);
 
     int evfd = ev_open();
     struct io sig_io = {.fd = g_sig_pipe[0], .kind = IO_PIPE}, lis_io = {.fd = lfd, .kind = IO_LISTEN};
@@ -107,6 +113,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < s.nloops; i++)
         loop_join(&s.loops[i]);
     free(s.loops);
+    config_free(cfg);
     fprintf(stderr, "shutdown complete\n");
     return 0;
 }

@@ -1,14 +1,13 @@
 #include "exchange.h"
 #include "conn.h"
 #include "loop.h"
+#include "route.h"
 #include "server.h"
+#include "static.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define MAX_BODY (10 * 1024 * 1024)
-#define MAX_DISK (256LL * 1024 * 1024)
 
 static void stop_handler(struct conn *c)
 {
@@ -57,7 +56,8 @@ void exchange_error(struct conn *c, int status, const char *extra)
         exchange_abort(c);
         return;
     }
-    if (!ex->dec.done) /* 본문을 다 읽지 않았으면 다음 요청의 시작을 알 수 없다 → 닫는다 */
+    /* 본문을 다 읽지 않았거나 형식을 믿을 수 없으면 다음 요청의 시작을 알 수 없다 → 닫는다 */
+    if (!ex->dec.done || status == 400)
         ex->reply.keep = false;
     char body[256];
     int n = snprintf(body, sizeof body, "<!doctype html><meta charset=utf-8><title>%d %s</title><h1>%d %s</h1>\n",
@@ -70,22 +70,41 @@ void exchange_error(struct conn *c, int status, const char *extra)
     }
 }
 
-/* 라우팅이 생기기 전까지의 임시 핸들러: 받은 것을 그대로 알려 준다 */
-static void echo_start(struct conn *c)
+/* 아직 만들지 않은 칸: 어디로 갈 요청인지만 알려 준다 */
+static void todo_start(struct conn *c)
 {
     struct exchange *ex = c->ex;
     char body[512];
-    int n = snprintf(body, sizeof body, "method=%.*s host=%s path=%s query=%.*s body=%lld\n",
-                     (int)ex->req.method_text.n, ex->req.method_text.p, ex->host, ex->path,
-                     (int)ex->target.query.n, ex->target.query.n ? ex->target.query.p : "", ex->body.size);
-    if (n >= (int)sizeof body)
-        n = (int)sizeof body - 1;
+    const struct route *r = ex->route;
+    int n = snprintf(body, sizeof body, "%s %s로 갈 요청: path=%s body=%lld\n",
+                     r->act == ACT_PROXY ? "proxy" : "cgi", r->pool ? r->pool->name : r->dir,
+                     strlen(ex->path) < 300 ? ex->path : "(긴 경로)", ex->body.size);
     if (reply_text(&ex->reply, &c->out, 200, "text/plain; charset=utf-8", body, (size_t)n, NULL))
         exchange_finish(c);
     else
         exchange_abort(c);
 }
-static const struct handler echo_handler = {.name = "echo", .start = echo_start};
+static const struct handler todo_handler = {.name = "todo", .start = todo_start};
+
+static const struct handler *handler_for(const struct route *r)
+{
+    switch (r->act) {
+    case ACT_STATIC: return &static_handler;
+    case ACT_PROXY: return &todo_handler;
+    case ACT_CGI: return &todo_handler;
+    }
+    return NULL;
+}
+
+/* 이 동작이 받을 수 있는 메서드. NULL = 전부 */
+static const char *allowed(const struct route *r, enum http_method m)
+{
+    if (r->act == ACT_STATIC && m != M_GET && m != M_HEAD)
+        return "Allow: GET, HEAD\r\n";
+    if (r->act == ACT_CGI && m != M_GET && m != M_HEAD && m != M_POST)
+        return "Allow: GET, HEAD, POST\r\n";
+    return NULL;
+}
 
 static void start_handler(struct conn *c)
 {
@@ -98,6 +117,7 @@ static void decide(struct conn *c, int status)
 {
     struct exchange *ex = c->ex;
     struct http_req *r = &ex->req;
+    const struct config *cfg = c->loop->srv->cfg;
     ex->reply.minor = r->minor;
     ex->reply.head_only = r->method == M_HEAD && status == 0;
     ex->reply.keep = status == 0 && r->keep && !c->loop->draining;
@@ -123,13 +143,21 @@ static void decide(struct conn *c, int status)
     }
     if (status == 0 && r->expect_other)
         status = 417;
-    if (status == 0 && r->length > MAX_BODY)
+    const char *allow = NULL;
+    if (status == 0) {
+        ex->route = route_find(cfg, ex->host, ex->path);
+        if (!ex->route)
+            status = 404;
+        else if ((allow = allowed(ex->route, r->method)))
+            status = 405;
+    }
+    if (status == 0 && r->length > cfg->max_body)
         status = 413; /* 길이를 미리 알면 본문을 받기 전에 거절한다 */
     if (status) {
-        exchange_error(c, status, NULL);
+        exchange_error(c, status, allow);
         return;
     }
-    ex->h = &echo_handler;
+    ex->h = handler_for(ex->route);
     if (ex->dec.done)
         start_handler(c);
     else
@@ -188,6 +216,7 @@ bool exchange_head(struct conn *c)
 bool exchange_body(struct conn *c)
 {
     struct exchange *ex = c->ex;
+    const struct config *cfg = c->loop->srv->cfg;
     if (ex->req.expect_100 && !ex->sent_100 && buf_len(&c->in) == 0) {
         /* 클라이언트가 "보내도 되나요?"를 묻고 기다리는 중. 최종 응답을 정하지 않은 지금만 보낼 수 있다 */
         buf_append(&c->out, "HTTP/1.1 100 Continue\r\n\r\n", 25);
@@ -199,10 +228,10 @@ bool exchange_body(struct conn *c)
         long used = body_next(&ex->dec, buf_head(&c->in), buf_len(&c->in), &data);
         int status = used < 0 ? 400 : 0;
         if (!status && data.n) {
-            if (ex->body.size + (long long)data.n > MAX_BODY)
+            if (ex->body.size + (long long)data.n > cfg->max_body)
                 status = 413;
             else
-                status = spool_append(&ex->body, data.p, data.n, MAX_DISK);
+                status = spool_append(&ex->body, data.p, data.n, cfg->max_disk);
         }
         if (status) {
             exchange_error(c, status, NULL);
