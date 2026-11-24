@@ -1,4 +1,5 @@
 #include "exchange.h"
+#include "app.h"
 #include "conn.h"
 #include "loop.h"
 #include "route.h"
@@ -78,6 +79,7 @@ static const struct handler *handler_for(const struct route *r)
     switch (r->act) {
     case ACT_STATIC: return &static_handler;
     case ACT_PROXY: return &proxy_handler;
+    case ACT_APP: return app_handler;
     }
     return NULL;
 }

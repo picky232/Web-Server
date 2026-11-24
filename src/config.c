@@ -1,4 +1,5 @@
 #include "config.h"
+#include "app.h"
 #include "log.h"
 
 #include <errno.h>
@@ -130,7 +131,7 @@ static bool open_dir(struct route *r, const char *dir, char *err, size_t cap)
     return true;
 }
 
-/* route 호스트 접두사 static 폴더 | proxy 묶음 [cache [cookies]] */
+/* route 호스트 접두사 static 폴더 | proxy 묶음 [cache [cookies]] | app 대상 */
 static bool parse_route(struct config *c, char **t, int n, char *err, size_t cap)
 {
     if (n < 5)
@@ -165,6 +166,12 @@ static bool parse_route(struct config *c, char **t, int n, char *err, size_t cap
             else
                 return fail(err, cap, "route: 모르는 옵션입니다: %s (cache, cache cookies)", t[i]);
         }
+    } else if (!strcmp(t[3], "app")) {
+        r->act = ACT_APP;
+        if (n != 5)
+            return fail(err, cap, "route: app 뒤에는 대상 하나만 적습니다");
+        if (!app_open(t[4], err, cap))
+            return false;
     } else {
         return fail(err, cap, "route: 모르는 동작입니다: %s", t[3]);
     }

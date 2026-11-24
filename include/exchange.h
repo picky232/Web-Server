@@ -56,6 +56,7 @@ struct exchange {
         struct static_st file;
         struct proxy_st proxy;
         struct cache_st cache;
+        void *app; /* 앱이 스스로 할당하고 stop에서 해제한다 */
     } u; /* 핸들러별 상태 */
 };
 

@@ -4,7 +4,7 @@
 #include "balance.h"
 #include "net.h"
 
-enum action { ACT_STATIC, ACT_PROXY };
+enum action { ACT_STATIC, ACT_PROXY, ACT_APP };
 
 struct route {
     char host[256];   /* "*" = 아무 호스트나 */
