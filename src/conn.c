@@ -10,6 +10,7 @@
 
 #define OUT_MAX (65536 + 32768) /* 본문 64KB + 머리가 들어갈 여유 */
 #define RUN_BUDGET 16           /* 한 번에 이만큼만 나아가고 다른 연결에 차례를 넘긴다 */
+#define GATHER 16384
 #define LINGER_MAX 262144
 #define LINGER_MS 2000
 
@@ -231,7 +232,9 @@ void conn_run(struct conn *c)
         if (c->state == CS_DEAD)
             break;
         moved = step(c);
-        if (c->state != CS_DEAD)
+        /* 머리만 먼저 보내지 않고, 이어서 나올 본문과 모아 한 번에 보낸다 (시스템 콜과 패킷이 절반) */
+        bool more = moved && c->state == CS_RESPOND && buf_len(&c->out) < GATHER;
+        if (c->state != CS_DEAD && !more)
             moved |= flush(c);
     }
     if (c->state == CS_DEAD)

@@ -1337,7 +1337,9 @@ class Limits(unittest.TestCase):
         c = self.connect(b"GET /big HTTP/1.1\r\n" + H + b"\r\n", rcvbuf=65536)
         idle = self.connect(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
         got = len(c.recv(1000))
-        idle.recv(4096)
+        first = b""
+        while not first.endswith(b"hello"):
+            first += idle.recv(4096)
         s.p.send_signal(signal.SIGTERM)
         time.sleep(0.5)
         with self.assertRaises(OSError):
