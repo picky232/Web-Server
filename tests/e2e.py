@@ -1410,13 +1410,134 @@ class Watchdog(unittest.TestCase):
 
     def test_crash_leaves_a_record_and_comes_back(self):
         self.start()
+        for what in ("crash", "segv", "trap"):  # abort, 잘못된 메모리 접근, 함정 명령
+            w = self.workers()[0]
+            self.get(f"/__fault/{what}?token=secret")
+            self.wait(lambda: self.workers() not in ([], [w]) and self.get() == 200, 6)
+            self.assertRegex(self.text(), rf"처리 중이던 요청: 루프 \d GET /__fault/{what}\n")
+        self.assertIn("죽었습니다(시그널", self.text())
+        self.assertNotIn("소식이 없습니다", self.text())  # 멈춤이 아니라 죽음으로 바로 알아챘다
+        self.assertNotIn("secret", self.text())
+
+    def test_crash_with_a_blocked_log_still_dies(self):
+        r, w = os.pipe()
+        os.set_blocking(w, False)
+        try:
+            while True:
+                os.write(w, b"x" * 512)
+        except BlockingIOError:
+            pass
+        os.set_blocking(w, True)
+        port = free_port()
+        p = subprocess.Popen([str(ROOT / os.environ["FAULT"]), "-p", str(port), "-r", f"{ROOT}/www"], stderr=w)
+        os.close(w)
+        try:
+            time.sleep(0.8)
+            c = socket.create_connection(("127.0.0.1", port), 2)
+            c.sendall(b"GET /__fault/crash HTTP/1.1\r\n" + H + b"\r\n")
+            self.assertLess(p.wait(5), 0)
+            c.close()
+        finally:
+            os.close(r)
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+        self.start()
+
+    def download(self):
+        c = socket.socket()
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+        c.connect(("127.0.0.1", self.port))
+        c.settimeout(20)
+        c.sendall(b"GET /dl/big HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        return c, len(c.recv(1000))
+
+    def rest(self, c, got):
+        try:
+            while d := c.recv(1 << 20):
+                got += len(d)
+        except OSError:
+            pass
+        c.close()
+        return got
+
+    def prepare_download(self, conf):
+        d = tempfile.mkdtemp(prefix="webserver-dl-")
+        Path(d, "big").write_bytes(b"x" * (30 << 20))
+        self.addCleanup(shutil.rmtree, d, True)
+        return f"route * /dl static {d}\n" + conf
+
+    def test_signal_to_both_still_drains(self):
+        # pkill처럼 감독과 워커 모두에게 SIGTERM이 가도 "두 번째 = 당장"으로 오해하지 않는다
+        self.start(self.prepare_download("timeout_drain 20s\n"))
+        c, got = self.download()
+        for pid in (self.workers()[0], self.p.pid):
+            os.kill(pid, signal.SIGTERM)
+        time.sleep(1.5)
+        self.assertGreater(self.rest(c, got), 30 << 20)
+        self.assertEqual(self.p.wait(10), 0)
+
+    def test_second_stop_is_immediate(self):
+        self.start(self.prepare_download("timeout_drain 20s\n"))
+        c, _ = self.download()
+        t = time.time()
+        self.p.terminate()
+        time.sleep(0.4)
+        self.p.terminate()
+        self.p.wait(10)
+        self.assertLess(time.time() - t, 4)
+        c.close()
+
+    def test_draining_worker_is_not_mistaken_for_a_hung_one(self):
+        self.start(self.prepare_download("timeout_drain 20s\n"))
+        c, got = self.download()
         w = self.workers()[0]
-        self.get("/__fault/crash?token=secret")
-        self.wait(lambda: self.workers() and self.workers()[0] != w and self.get() == 200)
-        t = self.text()
-        self.assertRegex(t, r"처리 중이던 요청: 루프 \d GET /__fault/crash")
-        self.assertRegex(t, r"죽었습니다\(시그널 6\)")
-        self.assertNotIn("secret", t)
+        os.kill(w, signal.SIGTERM)  # 워커에게만. 마무리하는 동안에도 심장 박동은 이어진다
+        time.sleep(6)
+        self.assertNotIn("소식이 없습니다", self.text())
+        self.assertGreater(self.rest(c, got), 30 << 20)
+        self.wait(lambda: self.workers() not in ([], [w]) and self.get() == 200)
+
+    def reload(self, conf):
+        n = self.text().count("준비됨")
+        path = Path(self.d, "c.conf")
+        path.write_text(f"listen 127.0.0.1:{self.port}\nloops 2\naccess_log off\ntimeout_drain 500ms\nroute * / static {ROOT}/www\n{conf}")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: self.text().count("준비됨") > n)
+
+    def test_reload_also_changes_what_the_supervisor_uses(self):
+        self.start(self.prepare_download("timeout_drain 300ms\n"))
+        self.reload(self.prepare_download("timeout_drain 30s\nwatchdog off\n"))
+        c, got = self.download()
+        self.reload("")
+        time.sleep(7)  # 옛 값(0.3초 + 5초)이었다면 이미 강제로 끝났다
+        self.assertNotIn("강제로", self.text())
+        self.assertGreater(self.rest(c, got), 30 << 20)
+        w = self.workers()
+        self.reload("watchdog off\n")
+        self.wait(lambda: len(self.workers()) == 1 and self.workers() != w)
+        w = self.workers()[0]
+        os.kill(w, signal.SIGSTOP)
+        time.sleep(5)
+        self.assertEqual(self.workers(), [w])
+        os.kill(w, signal.SIGCONT)
+
+    def test_reload_during_a_failed_spawn_is_retried(self):
+        self.start()
+        exe = Path(self.d, "srv")
+        shutil.copy(ROOT / os.environ["FAULT"], exe)
+        self.p.terminate()
+        self.p.wait(10)
+        self.p = subprocess.Popen([str(exe), "-c", str(Path(self.d, "c.conf")), "-s"], stderr=self.err)
+        self.wait(lambda: self.get() == 200)
+        w = self.workers()[0]
+        exe.rename(str(exe) + "x")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: "띄우지 못했습니다" in self.text())
+        time.sleep(1.5)
+        self.assertLess(self.text().count("띄우지 못했습니다"), 8)  # 간격이 두 배씩 늘어난다
+        Path(str(exe) + "x").rename(exe)
+        self.wait(lambda: self.workers() and w not in self.workers() and self.get() == 200)
 
     def test_stopping_with_a_hung_loop_still_ends(self):
         for supervise in (True, False):
@@ -1591,7 +1712,7 @@ class Supervisor(unittest.TestCase):
     def test_crashed_worker_comes_back(self):
         w = self.workers()[0]
         os.kill(w, signal.SIGKILL)
-        self.wait(lambda: self.workers() and self.workers()[0] != w and self.get() == "a")
+        self.wait(lambda: self.workers() not in ([], [w]) and self.get() == "a")
 
     def test_stop_and_orphan(self):
         w = self.workers()[0]

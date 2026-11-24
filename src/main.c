@@ -40,6 +40,7 @@ static void setup_signals(void)
     sa.sa_handler = on_signal;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGQUIT, &sa, NULL);
     sa.sa_handler = SIG_DFL; /* 무시 상태를 물려받으면 커널이 CGI 자식을 알아서 치워 우리가 회수할 수 없다 */
     sigaction(SIGCHLD, &sa, NULL);
     sa.sa_handler = SIG_IGN; /* 끊긴 연결에 쓰면 프로세스가 죽는 대신 EPIPE를 받는다 */
@@ -159,7 +160,7 @@ static bool all_moving(struct server *s)
     for (int i = 0; i < s->nloops; i++) {
         struct loop *l = &s->loops[i];
         unsigned b = atomic_load(&l->beats);
-        bool stuck = b == l->seen_beats;
+        bool stuck = b == l->seen_beats && !atomic_load(&l->done); /* 할 일을 마치고 끝난 루프는 멈춘 것이 아니다 */
         if (stuck && !l->stuck)
             log_note("루프 %d이(가) 1초 넘게 움직이지 않습니다", i);
         l->stuck = stuck;
@@ -173,6 +174,7 @@ static bool all_moving(struct server *s)
 static void run(struct server *s, struct config *cfg, int evfd, struct door *doors, int ndoors, int alive_fd, int beat_fd)
 {
     long long next_beat = now_ms() + 1000, force_at = 0;
+    bool supervised = alive_fd >= 0;
     long long paused_until = 0, kill_at = 0;
     int signals = 0;
     while (signals == 0 || atomic_load(&s->loops_alive) > 0) {
@@ -188,27 +190,32 @@ static void run(struct server *s, struct config *cfg, int evfd, struct door *doo
                 health_event(ev[i].io, ev[i].ready, now);
             }
         }
-        char sig[16];
-        bool stop = read(g_sig_pipe[0], sig, sizeof sig) > 0;
+        unsigned char sig[16];
+        ssize_t got = read(g_sig_pipe[0], sig, sizeof sig);
+        bool stop = false, at_once = false;
+        for (ssize_t i = 0; i < got; i++) {
+            /* 감독 아래에서는 SIGTERM을 몇 번 받아도 한 번으로 친다. 운영 도구가 감독과 워커 모두에게 보내면
+               감독이 전한 것과 합쳐 두 번이 되기 때문이다. "당장"은 SIGQUIT으로 따로 받는다 */
+            at_once = at_once || sig[i] == SIGQUIT || (!supervised && signals + i > 0);
+            stop = true;
+        }
         if (alive_fd >= 0 && read(alive_fd, sig, 1) == 0) { /* 감독이 죽었다. 혼자 남지 않는다 */
             alive_fd = -1;
-            stop = signals == 0; /* 이미 마무리 중이면 "두 번째 시그널"로 치지 않는다 */
+            stop = true;
         }
-        if (stop) {
-            if (signals++ == 0) {
-                log_note("종료 시작: 처리 중인 요청을 마칩니다");
-                for (int k = 0; k < ndoors; k++) {
-                    while (accept_some(s, doors[k].io.fd, doors[k].origin) == ACCEPT_MORE)
-                        ; /* 이미 handshake가 끝난 연결까지 받고 */
-                    ev_set(evfd, &doors[k].io, 0);
-                    close(doors[k].io.fd); /* 문을 닫는다. 이제 새 연결은 커널이 거절한다 */
-                }
-                set_phase(s, PHASE_DRAIN);
-                kill_at = now + cfg->drain_ms;
-            } else {
-                kill_at = now; /* 두 번째 시그널: 기다리지 않는다 */
+        if (stop && signals++ == 0) {
+            log_note("종료 시작: 처리 중인 요청을 마칩니다");
+            for (int k = 0; k < ndoors; k++) {
+                while (accept_some(s, doors[k].io.fd, doors[k].origin) == ACCEPT_MORE)
+                    ; /* 이미 handshake가 끝난 연결까지 받고 */
+                ev_set(evfd, &doors[k].io, 0);
+                close(doors[k].io.fd); /* 문을 닫는다. 이제 새 연결은 커널이 거절한다 */
             }
+            set_phase(s, PHASE_DRAIN);
+            kill_at = now + cfg->drain_ms;
         }
+        if (at_once && !force_at)
+            kill_at = now;
         for (int k = 0; signals == 0 && k < ndoors; k++)
             ev_set(evfd, &doors[k].io, now < paused_until ? 0 : IO_R);
         if (kill_at && now >= kill_at) {
@@ -221,7 +228,7 @@ static void run(struct server *s, struct config *cfg, int evfd, struct door *doo
             log_note("멈춘 루프가 있어 강제로 끝냅니다");
             _exit(3);
         }
-        if (now >= next_beat && signals == 0) {
+        if (now >= next_beat) { /* 마무리하는 동안에도 보낸다. 안 보내면 멈춘 것으로 오해받는다 */
             next_beat = now + 1000;
             if (all_moving(s) && beat_fd >= 0)
                 (void)!write(beat_fd, ".", 1); /* 감독에게: 모두 살아 있다 */
@@ -316,7 +323,7 @@ int main(int argc, char **argv)
     log_note("listening on port %d (loops %d)", net_local_port(doors[0].io.fd), s.nloops);
 
     if (in.ready >= 0) /* 감독에게: 이제 받을 수 있다. 옛 워커를 내보내도 된다 */
-        (void)!write(in.ready, "R", 1);
+        (void)!write(in.ready, &(struct ready_msg){cfg->drain_ms, cfg->watchdog}, sizeof(struct ready_msg));
     run(&s, cfg, evfd, doors, ndoors, in.alive, in.ready);
 
     health_stop();

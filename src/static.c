@@ -33,6 +33,10 @@ int open_under(int root_fd, const char *rel, struct stat *st)
             sleep(1000); /* 루프 스레드가 멈춘 상황 */
         if (!strcmp(rel + 9, "crash"))
             abort();
+        if (!strcmp(rel + 9, "segv"))
+            *(volatile int *)8 = 0;
+        if (!strcmp(rel + 9, "trap"))
+            __builtin_trap();
         errno = !strcmp(rel + 9, "emfile") ? EMFILE : EIO;
         return -1;
     }

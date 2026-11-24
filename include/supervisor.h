@@ -10,12 +10,17 @@
    그 사이에 온 연결도 잃지 않는다. 워커가 죽으면 다시 띄우고, 심장 박동이 끊기면(멈춤) 새 워커로 바꾼다 */
 int supervisor_run(struct config *cfg, char **argv);
 
+/* 워커가 준비됐을 때 파이프로 보내는 것. 감독은 설정을 다시 읽지 않으므로, 그 워커의 값을 워커가 알려 준다 */
+struct ready_msg {
+    int drain_ms, watchdog;
+};
+
 /* 워커 쪽: 감독이 넘겨준 fd들. 감독 없이 실행됐으면 n = 0 */
 struct inherited {
     int n;      /* listen 소켓 수 */
     int fd[2];  /* web, admin 순서 */
     int alive;  /* 감독이 죽으면 EOF가 되는 파이프. 없으면 -1 */
-    int ready;  /* 준비가 끝나면 한 바이트, 그 뒤로 1초마다 한 바이트(심장 박동)를 쓰는 파이프. 없으면 -1 */
+    int ready;  /* 준비가 끝나면 struct ready_msg, 그 뒤로 1초마다 한 바이트(심장 박동)를 쓰는 파이프. 없으면 -1 */
 };
 struct inherited supervisor_inherit(void);
 

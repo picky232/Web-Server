@@ -2,12 +2,21 @@
 #include "conn.h"
 #include "server.h"
 
+#include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #define STACK_SIZE 65536
+
+static const int g_fatal[] = {SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE, SIGTRAP};
+
+void crash_unblock(sigset_t *set)
+{
+    for (size_t i = 0; i < sizeof g_fatal / sizeof g_fatal[0]; i++)
+        sigdelset(set, g_fatal[i]);
+}
 
 /* sanitizer 빌드는 자기 처리기로 더 자세히 알려 준다. 덮어쓰지 않는다 */
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
@@ -48,13 +57,22 @@ static void add_num(struct line *l, int v)
     add(l, d + n, sizeof d - n);
 }
 
+/* 로그를 받는 쪽이 막혀 있으면 쓰지 않는다. 여기서 잠들면 죽어야 할 프로세스가 죽지 못한다 */
+static void emit(const struct line *l)
+{
+    struct pollfd p = {.fd = STDERR_FILENO, .events = POLLOUT};
+    if (poll(&p, 1, 0) == 1)
+        (void)!write(STDERR_FILENO, l->p, l->n);
+}
+
 static void on_crash(int sig)
 {
+    signal(sig, SIG_DFL); /* SA_RESETHAND는 SIGILL·SIGTRAP에는 듣지 않는다 (POSIX). 안 하면 끝없이 되돌아온다 */
     struct line l = {.n = 0};
     add(&l, "죽음: 시그널 ", strlen("죽음: 시그널 "));
     add_num(&l, sig);
     add(&l, "\n", 1);
-    (void)!write(STDERR_FILENO, l.p, l.n);
+    emit(&l);
     for (int i = 0; i < g_srv->nloops; i++) {
         struct conn *c = atomic_load_explicit(&g_srv->loops[i].current, memory_order_relaxed);
         if (!c || !c->ex)
@@ -68,9 +86,9 @@ static void on_crash(int sig)
         if (c->ex->path) /* 쿼리는 남기지 않는다 */
             add(&l, c->ex->path, strnlen(c->ex->path, 200));
         add(&l, "\n", 1);
-        (void)!write(STDERR_FILENO, l.p, l.n);
+        emit(&l);
     }
-    raise(sig); /* SA_RESETHAND로 기본 처리로 돌아갔으니, 이 시그널로 죽는다 */
+    raise(sig); /* 기본 처리로 돌려놓았으니, 이 시그널로 죽는다 */
 }
 
 void *crash_thread_begin(void)
@@ -101,8 +119,7 @@ void crash_install(struct server *s)
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_crash;
     sa.sa_flags = (int)(SA_RESETHAND | SA_ONSTACK);
-    const int sigs[] = {SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE};
-    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++)
-        sigaction(sigs[i], &sa, NULL);
+    for (size_t i = 0; i < sizeof g_fatal / sizeof g_fatal[0]; i++)
+        sigaction(g_fatal[i], &sa, NULL);
 }
 #endif

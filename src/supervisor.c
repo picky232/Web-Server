@@ -70,6 +70,9 @@ struct worker {
     int fd;            /* 워커가 쓰는 파이프. 첫 바이트 = 준비됨, 그 뒤 = 심장 박동 */
     long long since;   /* 띄운 시각 */
     long long kill_at; /* 이 시각까지 안 끝나면 강제 종료. 0 = 정하지 않음 */
+    bool killed;       /* SIGKILL을 보냈다 */
+    int grace_ms;      /* 이 워커가 마무리할 시간(timeout_drain) + 여유 */
+    bool watch;        /* 이 워커를 감시하나 */
 };
 
 struct sup {
@@ -82,8 +85,6 @@ struct sup {
     int backoff_ms;
     int misses;          /* 심장 박동이 연속으로 안 온 횟수 */
     long long next_tick;
-    bool watch;
-    int grace_ms;        /* 마무리할 시간(timeout_drain) + 여유 */
     bool ever_ready;     /* 한 번이라도 워커가 준비된 적이 있다 */
     bool reload;         /* 새 워커가 뜨는 중에 SIGHUP이 또 왔다 */
     bool stopping;
@@ -100,6 +101,7 @@ static int move_up(int fd)
 static void spawn_worker(struct sup *s)
 {
     int rp[2];
+    s->started_at = now_ms(); /* 실패하더라도 시도한 시각. 다음 간격을 정하는 데 쓴다 */
     if (pipe(rp) < 0) {
         log_note("감독: pipe: %s", strerror(errno));
         return;
@@ -143,8 +145,7 @@ static void spawn_worker(struct sup *s)
         close(r);
         return;
     }
-    s->starting = (struct worker){.pid = pid, .fd = r, .since = now_ms()};
-    s->started_at = s->starting.since;
+    s->starting = (struct worker){.pid = pid, .fd = r, .since = s->started_at, .grace_ms = GRACE_MS};
 }
 
 /* 다시 띄울 때를 정한다. 첫 번째는 바로(0.1초), 거듭 실패하면 두 배씩 늘려 쉬지 않고 되살리느라 CPU를 쓰지 않게 한다 */
@@ -155,11 +156,12 @@ static void schedule(struct sup *s)
     s->respawn_at = now_ms() + s->backoff_ms;
 }
 
-static void tell(struct sup *s, struct worker *w)
+/* 마무리하라고 알린다 */
+static void tell(struct worker *w)
 {
     kill(w->pid, SIGTERM);
     if (!w->kill_at) /* 멈춘 워커는 SIGTERM을 듣지 못할 수 있다 */
-        w->kill_at = now_ms() + s->grace_ms;
+        w->kill_at = now_ms() + w->grace_ms;
 }
 
 static void drop_fd(struct worker *w)
@@ -171,17 +173,22 @@ static void drop_fd(struct worker *w)
 
 static void on_ready(struct sup *s)
 {
-    char b;
-    if (read(s->starting.fd, &b, 1) != 1)
+    struct ready_msg m;
+    if (read(s->starting.fd, &m, sizeof m) != (ssize_t)sizeof m)
         return; /* 준비하기 전에 죽었다. SIGCHLD에서 처리한다 */
+    if (s->starting.killed)
+        return; /* 시한을 넘겨 이미 죽인 워커. 믿고 옛 워커를 내보내면 둘 다 잃는다 */
     s->ever_ready = true;
+    s->starting.grace_ms = m.drain_ms + GRACE_MS;
+    s->starting.watch = m.watchdog;
+    if (!s->stopping)
+        s->starting.kill_at = 0; /* 시작 시한은 더 이상 의미가 없다 */
     log_note("감독: 워커 %d 준비됨", (int)s->starting.pid);
     if (s->current.pid) {
-        if (!s->stopping) /* 멈추는 중이면 이미 SIGTERM을 보냈다. 또 보내면 "당장 끝내라"가 된다 */
-            tell(s, &s->current);
+        if (!s->stopping)
+            tell(&s->current);
         drop_fd(&s->current);
-        if (s->nold < MAX_OLD)
-            s->old[s->nold++] = s->current;
+        s->old[s->nold++] = s->current; /* 자리는 띄우기 전에 확인했다 */
     }
     s->current = s->starting;
     s->starting = (struct worker){.fd = -1};
@@ -206,6 +213,7 @@ static void enforce(struct worker *w)
         return;
     log_note("감독: 워커 %d을(를) 강제로 끝냅니다", (int)w->pid);
     kill(w->pid, SIGKILL);
+    w->killed = true;
     w->kill_at = now_ms() + 1000;
 }
 
@@ -242,13 +250,17 @@ static void on_child(struct sup *s)
 
 static void stop_all(struct sup *s)
 {
-    /* 마무리 중인 옛 워커는 이미 SIGTERM을 받았다. 두 번째로 멈추라고 할 때만 또 보낸다 */
-    for (int i = 0; s->stopping && i < s->nold; i++)
-        tell(s, &s->old[i]);
-    if (s->current.pid)
-        tell(s, &s->current);
-    if (s->starting.pid)
-        tell(s, &s->starting);
+    struct worker *all[MAX_OLD + 2] = {&s->current, &s->starting};
+    for (int i = 0; i < s->nold; i++)
+        all[i + 2] = &s->old[i];
+    for (int i = 0; i < s->nold + 2; i++) {
+        if (!all[i]->pid)
+            continue;
+        if (s->stopping)
+            kill(all[i]->pid, SIGQUIT); /* 두 번째로 멈추라고 했다: 당장 */
+        else
+            tell(all[i]);
+    }
     s->stopping = true;
 }
 
@@ -275,8 +287,6 @@ int supervisor_run(struct config *cfg, char **argv)
     memset(&s, 0, sizeof s);
     s.argv = argv;
     s.current.fd = s.starting.fd = -1;
-    s.watch = cfg->watchdog;
-    s.grace_ms = cfg->drain_ms + GRACE_MS;
     bool ok = open_doors(&s, cfg) == 0 && net_pipe(g_pipe) == 0 && pipe(s.alive) == 0;
     config_free(cfg);
     if (!ok)
@@ -322,20 +332,23 @@ int supervisor_run(struct config *cfg, char **argv)
             s.starting.kill_at = now; /* 시작하다 멈춘 워커 */
         if (s.current.pid && now >= s.next_tick) {
             s.next_tick = now + 1000;
-            if (s.watch && !s.stopping)
+            if (s.current.watch && !s.stopping)
                 tick(&s);
         }
         if (s.stopping || s.starting.pid)
             continue;
-        bool hung = s.watch && s.current.pid && s.misses >= MISS_LIMIT;
+        bool hung = s.current.pid && s.misses >= MISS_LIMIT;
         bool reload = s.reload && s.current.pid; /* 뜨는 중에 온 SIGHUP도 여기서 이어서 처리된다 */
-        if (reload || ((hung || !s.current.pid) && now >= s.respawn_at)) {
+        if (!reload && !hung && s.current.pid) {
+            s.respawn_at = 0; /* 띄울 이유가 없다 */
+        } else if (now >= s.respawn_at && s.nold < MAX_OLD) {
             if (reload)
                 log_note("감독: 새 설정으로 워커를 띄웁니다");
-            s.reload = false;
             s.respawn_at = 0;
             spawn_worker(&s);
-            if (!s.starting.pid) /* 실행 파일 교체 중이거나 프로세스 한도. 포기하지 않고 다시 */
+            if (s.starting.pid)
+                s.reload = false;
+            else /* 실행 파일 교체 중이거나 프로세스 한도. 포기하지 않고 다시 */
                 schedule(&s);
         }
     }

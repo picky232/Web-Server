@@ -224,6 +224,7 @@ void conn_run(struct conn *c)
 {
     struct loop *l = c->loop;
     atomic_store_explicit(&l->current, c, memory_order_relaxed);
+    atomic_fetch_add_explicit(&l->beats, 1, memory_order_relaxed); /* 바쁜 것과 멈춘 것을 구별하려고 한 건마다 센다 */
     bool moved = true;
     for (int i = 0; moved && c->state != CS_DEAD; i++) {
         if (i == RUN_BUDGET) { /* 아직 할 일이 있지만 다른 연결도 돌봐야 한다 */

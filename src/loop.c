@@ -106,7 +106,7 @@ static void *loop_main(void *arg)
         int phase = atomic_load(&l->srv->phase);
         l->draining = phase >= PHASE_DRAIN;
         l->quit = phase >= PHASE_KILL;
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < n && atomic_load(&l->srv->phase) < PHASE_KILL; i++) {
             struct io *io = ev[i].io;
             if (io->dead)
                 continue;
@@ -146,6 +146,7 @@ static void *loop_main(void *arg)
     log_flush(l);
     buf_free(&l->log);
     crash_thread_end(stack);
+    atomic_store(&l->done, true);
     atomic_fetch_sub(&l->srv->loops_alive, 1);
     return NULL;
 }
@@ -167,6 +168,9 @@ int loop_start(struct loop *l, int id, struct server *srv)
     atomic_fetch_add(&srv->loops_alive, 1);
     sigset_t all, old;
     sigfillset(&all);
+    /* 잘못된 메모리 접근처럼 이 스레드 자신이 일으키는 것은 막지 않는다.
+       막으면 죽음 기록이 남지 않고, macOS에서는 죽지도 않고 같은 명령을 끝없이 반복한다 */
+    crash_unblock(&all);
     pthread_sigmask(SIG_SETMASK, &all, &old);
     int err = pthread_create(&l->thread, NULL, loop_main, l);
     pthread_sigmask(SIG_SETMASK, &old, NULL);

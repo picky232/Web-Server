@@ -83,7 +83,10 @@ void log_note(const char *fmt, ...)
     if ((size_t)n > sizeof line - 2)
         n = (int)sizeof line - 2;
     line[n++] = '\n';
-    pthread_mutex_lock(&g_lock); /* 쥔 쪽이 기다리는 일이 없으므로 오래 잡히지 않는다 */
+    /* 락을 기다리지 않는다. 쥔 루프가 멎은 디스크에 쓰는 중일 수 있고, 메인까지 같이 멎으면 그 사실을 알릴 수도 없다.
+       못 얻으면 줄이 섞일 수 있지만 그대로 쓴다 */
+    bool locked = pthread_mutex_trylock(&g_lock) == 0;
     write_some(STDERR_FILENO, line, (size_t)n, false);
-    pthread_mutex_unlock(&g_lock);
+    if (locked)
+        pthread_mutex_unlock(&g_lock);
 }

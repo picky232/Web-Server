@@ -1,4 +1,5 @@
 #include "config.h"
+#include "log.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -254,7 +255,7 @@ bool config_load(struct config *c, const char *path)
 {
     FILE *f = fopen(path, "re");
     if (!f) {
-        fprintf(stderr, "%s: %s\n", path, strerror(errno));
+        log_note("%s: %s", path, strerror(errno));
         return false;
     }
     char line[4096], err[512];
@@ -262,7 +263,7 @@ bool config_load(struct config *c, const char *path)
     for (int no = 1; ok && fgets(line, sizeof line, f); no++) {
         ok = config_line(c, line, err, sizeof err);
         if (!ok)
-            fprintf(stderr, "%s:%d: %s\n", path, no, err);
+            log_note("%s:%d: %s", path, no, err);
     }
     fclose(f);
     return ok;
