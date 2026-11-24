@@ -164,6 +164,25 @@ static void decide(struct conn *c, int status)
         conn_set_state(c, CS_BODY);
 }
 
+static struct exchange *new_exchange(struct conn *c)
+{
+    struct exchange *ex = calloc(1, sizeof *ex);
+    if (!ex) {
+        conn_set_state(c, CS_DEAD);
+        return NULL;
+    }
+    ex->start_ms = c->loop->now;
+    spool_init(&ex->body, &c->loop->srv->spool_bytes);
+    c->ex = ex;
+    return ex;
+}
+
+void exchange_reject(struct conn *c, int status)
+{
+    if (new_exchange(c))
+        decide(c, status);
+}
+
 bool exchange_head(struct conn *c)
 {
     /* 앞 요청 뒤에 붙은 빈 줄은 무시한다 (RFC 9112 2.2) */
@@ -184,14 +203,9 @@ bool exchange_head(struct conn *c)
             conn_set_state(c, CS_DEAD); /* 머리를 보내다 떠났다 */
         return c->rd_eof;
     }
-    struct exchange *ex = calloc(1, sizeof *ex);
-    if (!ex) {
-        conn_set_state(c, CS_DEAD);
+    struct exchange *ex = new_exchange(c);
+    if (!ex)
         return true;
-    }
-    c->ex = ex;
-    ex->start_ms = c->loop->now;
-    spool_init(&ex->body, &c->loop->srv->spool_bytes);
     int status = 400;
     if (full) {
         /* 첫 줄조차 안 끝났으면 주소가 너무 긴 것, 아니면 헤더가 너무 많은 것 */

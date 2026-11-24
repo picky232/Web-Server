@@ -30,7 +30,7 @@ OBJS := $(SRCS:src/%.c=$(BUILD)/obj/%.o)
 UNIT_OBJS := $(filter-out $(BUILD)/obj/main.o,$(OBJS)) \
              $(patsubst tests/unit/%.c,$(BUILD)/unit/%.o,$(wildcard tests/unit/*.c))
 
-.PHONY: all unit e2e test asan tsan clean
+.PHONY: all unit e2e test fault asan tsan clean
 all: $(BUILD)/webserver
 
 $(BUILD)/webserver: $(OBJS)
@@ -50,8 +50,12 @@ $(BUILD)/unit/%.o: tests/unit/%.c
 unit: $(BUILD)/unit_tests
 	$(BUILD)/unit_tests
 
-e2e: $(BUILD)/webserver
-	WEBSERVER=$(BUILD)/webserver $(PYTHON) tests/e2e.py
+e2e: $(BUILD)/webserver fault
+	WEBSERVER=$(BUILD)/webserver FAULT=build/fault/webserver $(PYTHON) -W ignore tests/e2e.py
+
+# 좀처럼 나지 않는 실패(디스크 오류, fd 부족)를 일부러 내는 시험 전용 빌드
+fault:
+	@$(MAKE) -s BUILD=build/fault EXTRA=-DFAULT_INJECT build/fault/webserver
 
 test: unit e2e
 

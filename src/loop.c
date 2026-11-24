@@ -121,6 +121,7 @@ static void *loop_main(void *arg)
     conn_close_all(l);
     upstream_close_all(l);
     reap_dead(l);
+    atomic_fetch_sub(&l->srv->loops_alive, 1);
     return NULL;
 }
 
@@ -137,6 +138,7 @@ int loop_start(struct loop *l, int id, struct server *srv)
     loop_watch(l, &l->pipe_io, IO_R);
 
     /* 시그널은 메인 스레드만 받게, 새 스레드는 전부 막고 시작한다 (마스크는 물려받는다) */
+    atomic_fetch_add(&srv->loops_alive, 1);
     sigset_t all, old;
     sigfillset(&all);
     pthread_sigmask(SIG_SETMASK, &all, &old);

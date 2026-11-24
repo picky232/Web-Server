@@ -719,6 +719,177 @@ class ProxyFailure(ProxyCase):
         time.sleep(0.2)
         self.assertEqual(s.get("/")[0], 200)
 
+# ---- 과부하, 제한 시간, 종료 ----
+
+class Limits(unittest.TestCase):
+    def serve(self, conf="", **kw):
+        self.www = tempfile.mkdtemp(prefix="webserver-www-")
+        Path(self.www, "index.html").write_text("hello")
+        Path(self.www, "big").write_bytes(b"x" * (30 << 20))
+        self.s = Server(f"route * / static {self.www}\n" + conf, **kw)
+        return self.s
+
+    def tearDown(self):
+        shutil.rmtree(self.www, ignore_errors=True)
+        if self.s.p.poll() is None:
+            self.s.stop()
+
+    def connect(self, data=b"", rcvbuf=0):
+        c = socket.socket()
+        if rcvbuf:
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        c.connect(("127.0.0.1", self.s.port))
+        c.settimeout(5)
+        if data:
+            c.sendall(data)
+        return c
+
+    def test_header_drip_gets_408(self):
+        s = self.serve("timeout_head 800ms\n")
+        c = self.connect(b"GET / HTTP/1.1\r\n")
+        t = time.time()
+        try:
+            while time.time() - t < 4:  # 0.2초마다 1바이트. 바이트마다 연장되면 끝나지 않는다
+                c.sendall(b"X")
+                time.sleep(0.2)
+                c.setblocking(False)
+                try:
+                    if c.recv(100).startswith(b"HTTP/1.1 408"):
+                        break
+                except BlockingIOError:
+                    pass
+                c.setblocking(True)
+        except OSError:
+            pass
+        self.assertLess(time.time() - t, 2)
+        c.close()
+
+    def test_silent_connection_is_closed(self):
+        self.serve("timeout_head 500ms\n")
+        c = self.connect()
+        t = time.time()
+        self.assertEqual(c.recv(10), b"")
+        self.assertLess(time.time() - t, 2)
+
+    def test_idle_keep_alive_is_closed(self):
+        self.serve("timeout_idle 500ms\n")
+        c = self.connect(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+        self.assertIn(b"hello", c.recv(4096))
+        t = time.time()
+        self.assertEqual(c.recv(10), b"")
+        self.assertLess(time.time() - t, 2)
+
+    def test_slow_body_gets_408(self):
+        b = Backend(ok())
+        self.serve(f"timeout_head 600ms\npool p 127.0.0.1:{b.port}\nroute * /up proxy p\n")
+        c = self.connect(b"POST /up HTTP/1.1\r\n" + H + b"Content-Length: 1000\r\n\r\nabc")
+        self.assertIn(b"408", c.recv(100))
+        self.assertEqual(b.requests, [])  # 느린 업로드는 백엔드에 닿지도 않는다
+        b.stop()
+
+    def test_reader_that_stops_is_cut(self):
+        self.serve("timeout_stall 700ms\n")
+        c = self.connect(b"GET /big HTTP/1.1\r\n" + H + b"\r\n", rcvbuf=4096)
+        time.sleep(2)
+        n = 0
+        try:
+            while d := c.recv(1 << 20):
+                n += len(d)
+        except ConnectionError:
+            pass
+        self.assertLess(n, 30 << 20)
+
+    def test_silent_connections_over_the_limit_do_not_block_others(self):
+        # 예전 구현의 결함: 침묵 4개에 9.7초 대기, 68개면 503
+        s = self.serve("max_connections 300\n")
+        idle = [self.connect() for _ in range(300)]
+        idle += [self.connect(b"G") for _ in range(100)]  # 상한보다 100개 더
+        t = time.time()
+        for _ in range(30):
+            self.assertEqual(s.get("/")[0], 200)
+        self.assertLess(time.time() - t, 1.5)
+        for c in idle:
+            c.close()
+
+    def test_busy_connections_are_not_evicted(self):
+        s = self.serve("max_connections 3\nloops 1\n")
+        busy = [self.connect(b"GET /big HTTP/1.1\r\n" + H + b"\r\n", rcvbuf=4096) for _ in range(3)]
+        time.sleep(0.3)
+        self.assertEqual(s.get("/")[0], 503)
+        for c in busy:
+            c.close()
+        time.sleep(0.2)
+        self.assertEqual(s.get("/")[0], 200)
+
+    def test_finishes_in_flight_on_sigterm(self):
+        s = self.serve()
+        c = self.connect(b"GET /big HTTP/1.1\r\n" + H + b"\r\n", rcvbuf=65536)
+        idle = self.connect(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+        got = len(c.recv(1000))
+        idle.recv(4096)
+        s.p.send_signal(signal.SIGTERM)
+        time.sleep(0.5)
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", s.port), 1)
+        self.assertEqual(idle.recv(10), b"")  # 쉬던 연결은 바로 닫는다
+        while d := c.recv(1 << 20):
+            got += len(d)
+        self.assertGreater(got, 30 << 20)
+        c.close()
+        s.stop()
+
+    def test_drain_has_a_deadline_and_second_signal_is_immediate(self):
+        for second in (False, True):
+            s = self.serve(f"timeout_drain {'30s' if second else '500ms'}\n")
+            c = self.connect(b"GET /big HTTP/1.1\r\n" + H + b"\r\n", rcvbuf=4096)
+            time.sleep(0.2)
+            t = time.time()
+            s.p.send_signal(signal.SIGTERM)
+            if second:
+                time.sleep(0.3)
+                s.p.send_signal(signal.SIGINT)
+            s.p.wait(5)
+            self.assertLess(time.time() - t, 2.5)
+            c.close()
+            s.stop()
+
+    def test_clients_that_vanish(self):
+        s = self.serve()
+        before = len(os.listdir("/dev/fd"))
+        rst = b"\1\0\0\0\0\0\0\0"
+        for i in range(400):
+            c = self.connect([b"", b"GET", b"GET /big HTTP/1.1\r\n" + H + b"\r\n", b"POST / HTTP/1.1\r\n" + H + b"Content-Length: 9\r\n\r\nab"][i % 4])
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, rst)
+            c.close()
+        time.sleep(0.6)
+        self.assertEqual(s.get("/")[0], 200)
+        out = subprocess.run(["lsof", "-p", str(s.p.pid)], capture_output=True).stdout.decode()
+        self.assertLessEqual(len(re.findall(r"ESTABLISHED|CLOSE_WAIT", out)), 2, out)
+
+    def test_low_fd_limit_lowers_max_connections(self):
+        import resource
+        s = self.serve("max_connections 1000\n", preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (400, 400)))
+        self.assertIn("max_connections를", s.stderr())
+        cs = [self.connect() for _ in range(100)]
+        self.assertEqual(s.get("/")[0], 200)
+        for c in cs:
+            c.close()
+
+
+@unittest.skipUnless(os.environ.get("FAULT"), "고장 주입 빌드에서만 (make e2e가 켠다)")
+class Faults(unittest.TestCase):
+    def test_disk_error_is_500_and_fd_shortage_is_503(self):
+        # 예전 구현의 결함: fd가 모자라면 있는 파일도 404, 500을 보내는 길이 없음
+        global BIN
+        saved, BIN = BIN, str(ROOT / os.environ["FAULT"])
+        s = Server(f"route * / static {ROOT}/www\n")
+        try:
+            self.assertEqual(s.get("/__fault/eio")[0], 500)
+            self.assertEqual(s.get("/__fault/emfile")[0], 503)
+        finally:
+            BIN = saved
+            s.stop()
+
 
 class Config(unittest.TestCase):
     def run_conf(self, text, *args):

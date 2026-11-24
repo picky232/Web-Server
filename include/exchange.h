@@ -52,6 +52,7 @@ struct exchange {
 bool exchange_head(struct conn *c);    /* 요청 머리를 읽고 어떻게 처리할지 결정 */
 bool exchange_body(struct conn *c);    /* 요청 본문 모으기 */
 void exchange_error(struct conn *c, int status, const char *extra);
+void exchange_reject(struct conn *c, int status); /* 요청을 해석하기 전에 거절 */
 void exchange_finish(struct conn *c);  /* 핸들러가 응답을 다 만들었다 */
 void exchange_abort(struct conn *c);   /* 응답 도중 실패: 연결을 끊어서 알린다 */
 void exchange_free(struct conn *c);

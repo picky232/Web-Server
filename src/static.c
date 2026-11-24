@@ -26,6 +26,12 @@ int open_under(int root_fd, const char *rel, struct stat *st)
 {
     char name[256];
     int dir = root_fd;
+#ifdef FAULT_INJECT /* 시험 빌드 전용: 좀처럼 나지 않는 실패를 일부러 낸다 */
+    if (!strncmp(rel, "/__fault/", 9)) {
+        errno = !strcmp(rel + 9, "emfile") ? EMFILE : EIO;
+        return -1;
+    }
+#endif
     for (;;) {
         while (*rel == '/')
             rel++;

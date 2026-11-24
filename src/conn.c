@@ -11,14 +11,53 @@
 #define OUT_MAX (65536 + 32768) /* 본문 64KB + 머리가 들어갈 여유 */
 #define RUN_BUDGET 16           /* 한 번에 이만큼만 나아가고 다른 연결에 차례를 넘긴다 */
 #define LINGER_MAX 262144
-#define IDLE_MS 15000
-#define HEAD_MS 10000
 #define LINGER_MS 2000
+
+static void destroy(struct conn *c);
+
+/* 자리가 없을 때 누구를 먼저 내보낼까. 작을수록 먼저, -1 = 내보내지 않음 */
+static int evict_class(const struct conn *c)
+{
+    switch (c->state) {
+    case CS_HEAD:
+        if (c->first_byte)
+            return 2;                  /* 머리를 보내다 만 연결 */
+        return c->served ? 0 : 1;      /* 쉬는 연결, 아무것도 안 보낸 연결 */
+    case CS_BODY: return 3;            /* 본문을 보내다 만 연결 */
+    case CS_LINGER: return 0;
+    default:                           /* 응답을 1초 넘게 받아 가지 않는 연결 */
+        return c->send_since && c->loop->now - c->send_since > 1000 ? 4 : -1;
+    }
+}
+
+static bool evict_one(struct loop *l)
+{
+    struct conn *victim = NULL;
+    int best = 99;
+    for (struct conn *c = l->conns; c; c = c->next) {
+        int k = evict_class(c);
+        if (k < 0 || k > best || (k == best && c->since >= victim->since))
+            continue;
+        victim = c;
+        best = k;
+    }
+    if (!victim)
+        return false;
+    destroy(victim);
+    return true;
+}
 
 void conn_open(struct loop *l, int fd, int origin, const struct addr *peer)
 {
-    struct conn *c = calloc(1, sizeof *c);
+    const struct config *cfg = l->srv->cfg;
+    int share = (cfg->max_connections + l->srv->nloops - 1) / l->srv->nloops;
+    struct conn *c = NULL;
+    if (atomic_load(&l->nconn) <= share || evict_one(l))
+        c = calloc(1, sizeof *c);
     if (!c) {
+        static const char busy[] = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n"
+                                   "Retry-After: 1\r\nConnection: close\r\n\r\n";
+        (void)!write(fd, busy, sizeof busy - 1);
         close(fd);
         atomic_fetch_sub(&l->nconn, 1);
         return;
@@ -49,6 +88,13 @@ static void destroy(struct conn *c)
 {
     struct loop *l = c->loop;
     exchange_free(c);
+    if (c->in_ready) { /* 곧 해제되므로 "이어서 할 일" 목록에서도 뺀다 */
+        struct conn **p = &l->ready;
+        while (*p && *p != c)
+            p = &(*p)->next_ready;
+        if (*p)
+            *p = c->next_ready;
+    }
     if (c->prev)
         c->prev->next = c->next;
     else
@@ -96,6 +142,7 @@ static bool flush(struct conn *c)
         ssize_t r = write(c->io.fd, buf_head(&c->out), buf_len(&c->out));
         if (r > 0) {
             buf_consume(&c->out, (size_t)r);
+            c->send_bytes += r;
             moved = true;
         } else if (errno == EAGAIN || errno == EINTR) {
             break;
@@ -103,6 +150,12 @@ static bool flush(struct conn *c)
             c->state = CS_DEAD;
             break;
         }
+    }
+    if (!buf_len(&c->out)) {
+        c->send_since = 0;
+    } else if (!c->send_since) {
+        c->send_since = c->loop->now;
+        c->send_bytes = 0;
     }
     return moved;
 }
@@ -183,32 +236,46 @@ void conn_run(struct conn *c)
         update_interest(c);
 }
 
-/* 제한 시간이 지난 연결을 정리한다 */
+/* 최소 속도 규칙: 처음 grace 동안은 봐주고, 그 뒤로는 옮긴 바이트만큼만 시간을 준다.
+   "마지막으로 움직인 때부터 30초" 식이면 29초마다 1바이트씩 보내 영원히 붙잡을 수 있다 */
+static bool too_slow(const struct conn *c, long long since, long long bytes, long long grace)
+{
+    return c->loop->now - since > grace + bytes * 1000 / c->loop->srv->cfg->min_rate;
+}
+
+/* 모든 대기에는 끝이 있다 */
 static void check_time(struct conn *c)
 {
+    const struct config *cfg = c->loop->srv->cfg;
     long long now = c->loop->now;
-    bool late = false;
-    switch (c->state) {
-    case CS_HEAD:
-        if (c->first_byte) /* 첫 바이트부터 재므로 1바이트씩 보내도 늘어나지 않는다 */
-            late = now - c->first_byte > HEAD_MS;
-        else
-            late = now - c->since > IDLE_MS || c->loop->draining;
-        break;
-    case CS_LINGER: late = now - c->since > LINGER_MS; break;
-    case CS_RESPOND:
-        if (c->ex->deadline && now >= c->ex->deadline && c->ex->h->timeout) {
-            c->ex->h->timeout(c);
-            conn_run(c);
-            return;
-        }
-        break;
-    default: late = now - c->since > 60000; break;
-    }
-    if (late) {
+    bool act = false;
+    if (c->send_since && too_slow(c, c->send_since, c->send_bytes, cfg->stall_ms)) {
+        c->reset = true; /* 받아 가지 않는 클라이언트. 남은 응답을 커널이 계속 들고 있지 않게 끊는다 */
         c->state = CS_DEAD;
-        conn_run(c);
+        act = true;
+    } else if (c->state == CS_HEAD && c->first_byte) {
+        act = now - c->first_byte > cfg->head_ms; /* 첫 바이트부터 재므로 조금씩 보내도 늘어나지 않는다 */
+        if (act)
+            exchange_reject(c, 408);
+    } else if (c->state == CS_HEAD) {
+        act = now - c->since > (c->served ? cfg->idle_ms : cfg->head_ms) || c->loop->draining;
+        if (act)
+            c->state = CS_DEAD;
+    } else if (c->state == CS_BODY) {
+        act = too_slow(c, c->since, c->ex->body.size, cfg->head_ms);
+        if (act)
+            exchange_error(c, 408, NULL);
+    } else if (c->state == CS_RESPOND) {
+        act = c->ex->deadline && now >= c->ex->deadline && c->ex->h->timeout;
+        if (act)
+            c->ex->h->timeout(c);
+    } else if (c->state == CS_LINGER) {
+        act = now - c->since > LINGER_MS;
+        if (act)
+            c->state = CS_DEAD;
     }
+    if (act)
+        conn_run(c);
 }
 
 void conn_scan(struct loop *l)
