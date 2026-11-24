@@ -5,6 +5,7 @@
 #include "http.h"
 #include "reply.h"
 #include "spool.h"
+#include "upstream.h"
 #include "uri.h"
 
 struct static_st {
@@ -44,6 +45,7 @@ struct exchange {
     long long deadline; /* 핸들러가 정한 제한 시각. 0 = 없음 */
     union {
         struct static_st file;
+        struct proxy_st proxy;
     } u; /* 핸들러별 상태 */
 };
 

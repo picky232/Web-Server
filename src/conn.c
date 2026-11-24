@@ -196,6 +196,13 @@ static void check_time(struct conn *c)
             late = now - c->since > IDLE_MS || c->loop->draining;
         break;
     case CS_LINGER: late = now - c->since > LINGER_MS; break;
+    case CS_RESPOND:
+        if (c->ex->deadline && now >= c->ex->deadline && c->ex->h->timeout) {
+            c->ex->h->timeout(c);
+            conn_run(c);
+            return;
+        }
+        break;
     default: late = now - c->since > 60000; break;
     }
     if (late) {

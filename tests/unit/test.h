@@ -32,5 +32,6 @@ void test_uri(void);
 void test_reply(void);
 void test_spool(void);
 void test_config(void);
+void test_balance(void);
 
 #endif

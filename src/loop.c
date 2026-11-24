@@ -2,6 +2,7 @@
 #include "conn.h"
 #include "server.h"
 #include "str.h"
+#include "upstream.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -39,6 +40,7 @@ static void reap_dead(struct loop *l)
         l->dead = io->next_dead;
         switch (io->kind) {
         case IO_CLIENT: conn_free((struct conn *)io); break;
+        case IO_UPSTREAM: upconn_free((struct upconn *)io); break;
         default: free(io); break;
         }
     }
@@ -102,12 +104,14 @@ static void *loop_main(void *arg)
             switch (io->kind) {
             case IO_PIPE: read_mail(l); break;
             case IO_CLIENT: conn_run((struct conn *)io); break;
+            case IO_UPSTREAM: upstream_event((struct upconn *)io); break;
             default: break;
             }
         }
         run_ready(l);
         if (l->now >= l->next_scan || l->draining) {
             conn_scan(l);
+            upstream_scan(l);
             l->next_scan = l->now + SCAN_MS;
         }
         reap_dead(l);
@@ -115,6 +119,7 @@ static void *loop_main(void *arg)
             break;
     }
     conn_close_all(l);
+    upstream_close_all(l);
     reap_dead(l);
     return NULL;
 }
@@ -125,7 +130,8 @@ int loop_start(struct loop *l, int id, struct server *srv)
     l->id = id;
     l->srv = srv;
     l->evfd = ev_open();
-    if (l->evfd < 0 || net_pipe(l->pipe) < 0)
+    l->idle = calloc((size_t)srv->cfg->nbackends + 1, sizeof *l->idle);
+    if (l->evfd < 0 || !l->idle || net_pipe(l->pipe) < 0)
         return -1;
     l->pipe_io = (struct io){.fd = l->pipe[0], .kind = IO_PIPE};
     loop_watch(l, &l->pipe_io, IO_R);
@@ -146,4 +152,5 @@ void loop_join(struct loop *l)
     close(l->pipe[0]);
     close(l->pipe[1]);
     close(l->evfd);
+    free(l->idle);
 }

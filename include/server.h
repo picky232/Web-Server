@@ -9,7 +9,7 @@ struct server {
     const struct config *cfg;
     struct loop *loops;
     int nloops;
-    atomic_bool draining;
+    char via[64]; /* Via 헤더에 쓰는 내 이름 */
     atomic_llong spool_bytes; /* 지금 임시 파일에 있는 요청 본문 바이트 */
 };
 

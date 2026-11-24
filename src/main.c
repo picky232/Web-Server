@@ -1,3 +1,4 @@
+#include "health.h"
 #include "net.h"
 #include "server.h"
 #include "str.h"
@@ -84,6 +85,7 @@ int main(int argc, char **argv)
     struct server s;
     memset(&s, 0, sizeof s);
     s.cfg = cfg;
+    snprintf(s.via, sizeof s.via, "jiho-webserver-%d", net_local_port(lfd));
     s.nloops = cfg->loops ? cfg->loops : (int)sysconf(_SC_NPROCESSORS_ONLN);
     s.loops = calloc((size_t)s.nloops, sizeof *s.loops);
     for (int i = 0; i < s.nloops; i++)
@@ -97,16 +99,23 @@ int main(int argc, char **argv)
     struct io sig_io = {.fd = g_sig_pipe[0], .kind = IO_PIPE}, lis_io = {.fd = lfd, .kind = IO_LISTEN};
     ev_set(evfd, &sig_io, IO_R);
     ev_set(evfd, &lis_io, IO_R);
+    if (health_start(cfg, evfd) < 0)
+        return 1;
     for (bool stop = false; !stop;) {
-        struct ev_event ev[16];
-        int n = ev_wait(evfd, ev, 16, -1);
+        struct ev_event ev[64];
+        int n = ev_wait(evfd, ev, 64, cfg->nbackends ? 100 : -1);
+        long long now = now_ms();
         for (int i = 0; i < n; i++) {
-            if (ev[i].io == &lis_io)
+            if (ev[i].io->kind == IO_LISTEN)
                 accept_some(&s, lfd, ORIGIN_WEB);
+            else if (ev[i].io->kind == IO_HEALTH)
+                health_event(ev[i].io, ev[i].ready, now);
             else
                 stop = true;
         }
+        health_tick(now);
     }
+    health_stop();
     close(lfd);
     for (int i = 0; i < s.nloops; i++)
         loop_send(&s.loops[i], &(struct msg){.type = MSG_DRAIN});

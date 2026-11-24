@@ -9,6 +9,7 @@
 
 struct server;
 struct conn;
+struct idle_list;
 
 /* 메인 스레드가 루프 스레드에 보내는 쪽지. 파이프로 통째로 전달된다 (512바이트 이하는 쪼개지지 않음) */
 enum msg_type { MSG_CONN, MSG_DRAIN, MSG_KILL };
@@ -32,6 +33,7 @@ struct loop {
     atomic_int nconn;    /* 메인 스레드가 가장 한가한 루프를 고를 때 읽는다 */
     struct conn *ready;  /* 커널은 조용하지만 이어서 할 일이 남은 연결 */
     struct io *dead;     /* 이번 바퀴 끝에 free할 것 */
+    struct idle_list *idle; /* 백엔드별로 쉬는 연결 */
     long long now;       /* 이번 바퀴의 시각 */
     long long next_scan;
     bool draining, quit;

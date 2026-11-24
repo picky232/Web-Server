@@ -45,7 +45,8 @@ enum outcome {
 /* 백엔드를 하나 골라 자리를 예약한다. tried: 이번 요청에서 이미 써 본 백엔드 비트.
    모두 한도까지 찼으면 NULL */
 struct backend *pool_pick(struct pool *p, unsigned tried, long long now);
-void pool_done(struct pool *p, struct backend *b, enum outcome o, long long now);
+/* 자리를 돌려주고 결과를 기록한다. 이번 결과로 백엔드가 제외됐으면 그 이유, 아니면 NULL */
+const char *pool_done(struct pool *p, struct backend *b, enum outcome o, long long now);
 
 bool backend_usable(const struct backend *b, long long now);
 
