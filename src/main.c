@@ -3,6 +3,7 @@
 #include "resolver.h"
 #include "server.h"
 #include "str.h"
+#include "supervisor.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -113,9 +114,9 @@ struct door {
     int origin;
 };
 
-static bool open_door(struct door *d, const struct addr *a, int origin)
+static bool open_door(struct door *d, const struct addr *a, int origin, int given)
 {
-    int fd = net_listen(a);
+    int fd = given >= 0 ? given : net_listen(a);
     if (fd < 0) {
         char ip[64];
         int e = errno;
@@ -141,7 +142,7 @@ static int open_log(const struct config *cfg)
 }
 
 /* 메인 스레드가 하는 일: 새 연결 나눠 주기, 시그널, 헬스 체크. 요청 처리는 하지 않는다 */
-static void run(struct server *s, struct config *cfg, int evfd, struct door *doors, int ndoors)
+static void run(struct server *s, struct config *cfg, int evfd, struct door *doors, int ndoors, int alive_fd)
 {
     long long paused_until = 0, kill_at = 0;
     int signals = 0;
@@ -159,7 +160,12 @@ static void run(struct server *s, struct config *cfg, int evfd, struct door *doo
             }
         }
         char sig[16];
-        if (read(g_sig_pipe[0], sig, sizeof sig) > 0) {
+        bool stop = read(g_sig_pipe[0], sig, sizeof sig) > 0;
+        if (alive_fd >= 0 && read(alive_fd, sig, 1) == 0) { /* 감독이 죽었다. 혼자 남지 않는다 */
+            alive_fd = -1;
+            stop = true;
+        }
+        if (stop) {
             if (signals++ == 0) {
                 fprintf(stderr, "종료 시작: 처리 중인 요청을 마칩니다\n");
                 for (int k = 0; k < ndoors; k++) {
@@ -200,16 +206,35 @@ int main(int argc, char **argv)
         config_free(cfg);
         return rc == 1 ? 0 : rc;
     }
+    struct inherited in = supervisor_inherit();
+    if (cfg->supervise && !in.n)
+        return supervisor_run(cfg, argv);
     plan_fds(cfg);
     g_spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     setup_signals();
 
+    const struct addr *want[3] = {&cfg->listen};
+    int origins[3] = {ORIGIN_WEB}, ndoors = 1;
+    if (cfg->has_admin) {
+        want[ndoors] = &cfg->admin;
+        origins[ndoors++] = ORIGIN_ADMIN;
+    }
+    if (cfg->has_forward) {
+        want[ndoors] = &cfg->forward;
+        origins[ndoors++] = ORIGIN_FORWARD;
+    }
     struct door doors[3];
-    int ndoors = 0;
-    if (!open_door(&doors[ndoors++], &cfg->listen, ORIGIN_WEB) ||
-        (cfg->has_admin && !open_door(&doors[ndoors++], &cfg->admin, ORIGIN_ADMIN)) ||
-        (cfg->has_forward && !open_door(&doors[ndoors++], &cfg->forward, ORIGIN_FORWARD)) ||
-        (cfg->has_forward && resolver_start(2) < 0))
+    if (in.n && in.n != ndoors) {
+        fprintf(stderr, "listen, admin, forward를 더하거나 빼려면 감독 프로세스를 다시 시작해야 합니다\n");
+        return 2;
+    }
+    for (int k = 0; k < ndoors; k++) {
+        if (!open_door(&doors[k], want[k], origins[k], in.n ? in.fd[k] : -1))
+            return 1;
+        if (in.n && net_port(want[k]) != net_local_port(in.fd[k]))
+            fprintf(stderr, "포트 %d: 감독 프로세스를 다시 시작해야 바뀝니다\n", net_port(want[k]));
+    }
+    if (cfg->has_forward && resolver_start(2) < 0)
         return 1;
 
     struct server s;
@@ -238,7 +263,11 @@ int main(int argc, char **argv)
         return 1;
     fprintf(stderr, "listening on port %d (loops %d)\n", net_local_port(doors[0].io.fd), s.nloops);
 
-    run(&s, cfg, evfd, doors, ndoors);
+    if (in.ready >= 0) { /* 감독에게: 이제 받을 수 있다. 옛 워커를 내보내도 된다 */
+        (void)!write(in.ready, "R", 1);
+        close(in.ready);
+    }
+    run(&s, cfg, evfd, doors, ndoors, in.alive);
 
     health_stop();
     resolver_stop(); /* 이 뒤로는 루프에 쪽지를 보내지 않는다 */

@@ -272,11 +272,12 @@ bool config_load(struct config *c, const char *path)
 
 static void usage(const char *prog)
 {
-    printf("사용법: %s [-c 설정파일] [-p 포트] [-r 정적폴더] [-t 루프수]\n"
+    printf("사용법: %s [-c 설정파일] [-p 포트] [-r 정적폴더] [-t 루프수] [-s]\n"
            "  -c FILE  설정 파일 (예: conf/example.conf)\n"
            "  -p PORT  포트 (설정 파일보다 우선)\n"
            "  -r DIR   '/'에 정적 파일로 연결할 폴더 (설정 파일보다 우선)\n"
-           "  -t N     이벤트 루프 수 (기본: 코어 수)\n",
+           "  -t N     이벤트 루프 수 (기본: 코어 수)\n"
+           "  -s       감독 프로세스로 실행 (SIGHUP으로 무중단 설정 변경, 죽으면 다시 띄움)\n",
            prog);
 }
 
@@ -284,12 +285,13 @@ int config_args(struct config *c, int argc, char **argv)
 {
     const char *file = NULL, *port = NULL, *root = NULL, *loops = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "c:p:r:t:h")) != -1) {
+    while ((opt = getopt(argc, argv, "c:p:r:t:sh")) != -1) {
         switch (opt) {
         case 'c': file = optarg; break;
         case 'p': port = optarg; break;
         case 'r': root = optarg; break;
         case 't': loops = optarg; break;
+        case 's': c->supervise = true; break;
         case 'h': usage(argv[0]); return 1;
         default: usage(argv[0]); return 2;
         }

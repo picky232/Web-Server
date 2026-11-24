@@ -1222,6 +1222,124 @@ class Faults(unittest.TestCase):
             BIN = saved
             s.stop()
 
+# ---- 감독 프로세스 ----
+
+class Supervisor(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="webserver-sup-")
+        for n in ("a", "b"):
+            Path(self.d, n).mkdir()
+            Path(self.d, n, "index.html").write_text(n)
+            Path(self.d, n, "big").write_bytes(n.encode() * (20 << 20))
+        self.port = free_port()
+        self.conf = Path(self.d, "c.conf")
+        self.write("a")
+        self.err = open(Path(self.d, "err"), "w+")
+        self.p = subprocess.Popen([BIN, "-s", "-c", str(self.conf)], stderr=self.err)
+        self.wait(lambda: self.get() == "a")
+
+    def tearDown(self):
+        if self.p.poll() is None:
+            self.p.terminate()
+            self.p.wait(15)
+        self.err.close()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def write(self, which, extra=""):
+        self.conf.write_text(f"listen 127.0.0.1:{self.port}\nloops 2\naccess_log off\nroute * / static {self.d}/{which}\n{extra}")
+
+    def get(self):
+        try:
+            c = socket.create_connection(("127.0.0.1", self.port), 2)
+            c.settimeout(3)
+            c.sendall(b"GET / HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+            out = b""
+            while d := c.recv(4096):
+                out += d
+            c.close()
+            return parse(out)[2].decode()
+        except (OSError, ValueError):
+            return None
+
+    def wait(self, f, limit=8):
+        end = time.time() + limit
+        while time.time() < end:
+            if f():
+                return
+            time.sleep(0.05)
+        self.fail(Path(self.d, "err").read_text())
+
+    def workers(self):
+        return [int(x) for x in subprocess.run(["pgrep", "-P", str(self.p.pid)], capture_output=True).stdout.split()]
+
+    def test_reload_without_losing_a_request(self):
+        big = socket.socket()
+        big.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+        big.connect(("127.0.0.1", self.port))
+        big.settimeout(10)
+        big.sendall(b"GET /big HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        got = big.recv(1000)
+        lost, stop = [], threading.Event()
+
+        def hammer():
+            while not stop.is_set():
+                if self.get() not in ("a", "b"):
+                    lost.append(1)
+        ts = [threading.Thread(target=hammer) for _ in range(4)]
+        [t.start() for t in ts]
+        self.write("b")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: self.get() == "b")
+        time.sleep(0.5)
+        stop.set()
+        [t.join() for t in ts]
+        self.assertEqual(lost, [])
+        while d := big.recv(1 << 20):  # 옛 워커가 하던 다운로드는 끝까지
+            got += d
+        self.assertEqual(len(got) - got.index(b"\r\n\r\n") - 4, 20 << 20)
+        self.assertEqual(set(got[-1000:]), set(b"a"))
+        big.close()
+        self.wait(lambda: len(self.workers()) == 1)
+
+    def test_bad_config_keeps_the_old_one(self):
+        self.write("b", "nonsense here\n")
+        self.p.send_signal(signal.SIGHUP)
+        time.sleep(1)
+        self.assertEqual(self.get(), "a")
+        self.write("b")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: self.get() == "b")
+
+    def test_crashed_worker_comes_back(self):
+        w = self.workers()[0]
+        os.kill(w, signal.SIGKILL)
+        self.wait(lambda: self.workers() and self.workers()[0] != w and self.get() == "a")
+
+    def test_stop_and_orphan(self):
+        w = self.workers()[0]
+        self.p.terminate()
+        self.assertEqual(self.p.wait(10), 0)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(w, 0)
+        self.p = subprocess.Popen([BIN, "-s", "-c", str(self.conf)], stderr=self.err)
+        self.wait(lambda: self.get() == "a")
+        w = self.workers()[0]
+        self.p.kill()  # 감독만 갑자기 죽어도 워커가 혼자 남지 않는다
+        self.p.wait()
+
+        def gone():
+            try:
+                os.kill(w, 0)
+                return False
+            except ProcessLookupError:
+                return True
+        self.wait(gone)
+
+    def test_bad_config_at_start(self):
+        bad = Path(self.d, "bad.conf")
+        bad.write_text("nonsense x\n")
+        self.assertEqual(subprocess.run([BIN, "-s", "-c", str(bad)], stderr=subprocess.DEVNULL, timeout=10).returncode, 2)
+
 
 class Config(unittest.TestCase):
     def run_conf(self, text, *args):

@@ -21,6 +21,7 @@ struct route {
 struct config {
     struct addr listen, admin, forward;
     bool has_admin, has_forward;
+    bool supervise; /* -s: 감독 프로세스로 실행 */
     int loops; /* 0 = 코어 수 */
     int max_connections;
     long long max_body, max_disk, cache_size;
