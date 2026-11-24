@@ -8,6 +8,7 @@ struct server {
     struct loop *loops;
     int nloops;
     atomic_bool draining;
+    atomic_llong spool_bytes; /* 지금 임시 파일에 있는 요청 본문 바이트 */
 };
 
 /* 연결이 들어온 문 */
