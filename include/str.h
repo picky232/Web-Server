@@ -17,6 +17,8 @@ bool sl_to_ll(struct sl s, long long *out);            /* 0 이상 10진수만. 
 struct sl sl_trim(struct sl s);
 bool sl_copy(struct sl s, char *out, size_t cap);      /* '\0'을 붙여 복사. 안 들어가면 false */
 
-long long now_ms(void); /* 뒤로 가지 않는 시계. 제한 시간 계산용 */
+/* 뒤로 가지 않는 시계. 제한 시간 계산용 */
+long long now_us(void);
+long long now_ms(void);
 
 #endif

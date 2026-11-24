@@ -11,6 +11,9 @@ struct server {
     int nloops;
     char via[64]; /* Via 헤더에 쓰는 내 이름 */
     atomic_int loops_alive;
+    atomic_int cgi_running;
+    int log_fd; /* -1 = 끔 */
+    long long started_ms;
     atomic_llong spool_bytes; /* 지금 임시 파일에 있는 요청 본문 바이트 */
 };
 

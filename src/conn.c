@@ -73,6 +73,7 @@ void conn_open(struct loop *l, int fd, int origin, const struct addr *peer)
     if (l->conns)
         l->conns->prev = c;
     l->conns = c;
+    atomic_fetch_add(&l->accepted, 1);
     loop_watch(l, &c->io, IO_R);
 }
 

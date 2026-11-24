@@ -133,6 +133,19 @@ int net_pipe(int p[2])
     return 0;
 }
 
+int net_pipe_for_child(int p[2])
+{
+#ifdef __linux__
+    if (pipe2(p, O_CLOEXEC) < 0)
+        return -1;
+#else
+    if (pipe(p) < 0)
+        return -1;
+    fcntl(p[1], F_SETFD, FD_CLOEXEC);
+#endif
+    return net_nonblock(p[0]);
+}
+
 void net_ip(const struct addr *a, char *out, size_t cap)
 {
     const void *src = a->ss.ss_family == AF_INET6

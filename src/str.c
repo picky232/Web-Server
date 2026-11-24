@@ -62,9 +62,14 @@ bool sl_copy(struct sl s, char *out, size_t cap)
     return true;
 }
 
-long long now_ms(void)
+long long now_us(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+long long now_ms(void)
+{
+    return now_us() / 1000;
 }

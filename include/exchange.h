@@ -2,6 +2,7 @@
 #define EXCHANGE_H
 
 #include "body.h"
+#include "cgi.h"
 #include "http.h"
 #include "reply.h"
 #include "spool.h"
@@ -42,10 +43,13 @@ struct exchange {
     const struct handler *h;
     struct reply reply;
     long long start_ms;
+    char served_by[96]; /* 로그용: 누가 처리했나 */
+    int tries;
     long long deadline; /* 핸들러가 정한 제한 시각. 0 = 없음 */
     union {
         struct static_st file;
         struct proxy_st proxy;
+        struct cgi_st cgi;
     } u; /* 핸들러별 상태 */
 };
 

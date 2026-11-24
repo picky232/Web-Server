@@ -19,6 +19,7 @@ int net_accept(int lfd, struct addr *peer);           /* 안 기다리는 소켓
 int net_connect(const struct addr *a);                /* 연결을 시작만 한다. 결과는 쓰기 준비 이벤트 뒤 net_error */
 int net_error(int fd);                                /* 연결 결과. 0 = 성공, 그 외 errno */
 int net_pipe(int p[2]);                               /* 안 기다리는 파이프 */
+int net_pipe_for_child(int p[2]);                     /* 읽는 쪽만 안 기다림. 자식이 쓰는 쪽은 평범한 파이프 */
 int net_nonblock(int fd);                             /* O_NONBLOCK + FD_CLOEXEC */
 void net_nodelay(int fd);
 

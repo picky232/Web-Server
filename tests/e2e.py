@@ -719,6 +719,167 @@ class ProxyFailure(ProxyCase):
         time.sleep(0.2)
         self.assertEqual(s.get("/")[0], 200)
 
+# ---- CGI, 상태 페이지, 로그 ----
+
+class Cgi(Case):
+    @classmethod
+    def files(cls, d):
+        def script(name, text, mode=0o755):
+            p = Path(d, name)
+            p.write_text(text)
+            p.chmod(mode)
+        sh = "#!/bin/sh\n"
+        script("env", sh + "printf 'Content-Type: text/plain\\n\\n'; env | sort; echo args=$#\n")
+        script("echo", sh + "printf 'Content-Type: application/octet-stream\\r\\n\\r\\n'; cat\n")
+        script("status", sh + "printf 'Status: 418 Teapot\\nX-A: b\\n\\nhi'\n")
+        script("redirect", sh + "printf 'Location: http://x/y\\n\\n'\n")
+        script("length", sh + "printf 'Content-Length: 5\\n\\nhello'\n")
+        script("short", sh + "printf 'Content-Length: 50\\n\\nhello'\n")
+        script("nohead", sh + "echo no headers here\n")
+        script("empty", sh + "exit 0\n")
+        script("badhead", sh + "printf 'Bad Header\\n\\nx'\n")
+        script("nointerp", "#!/no/such/interpreter\n")
+        script("sleep", sh + "sleep 60 & sleep 60\n")
+        script("noexec", sh, 0o644)
+        script(".hidden", sh)
+        script("fds", "#!/usr/bin/env python3\nimport os\nprint('Content-Type: text/plain\\n')\nfor i in range(3, 300):\n    try:\n        os.fstat(i); print('open', i)\n    except OSError: pass\n")
+        script("head_first", "#!/usr/bin/env python3\nimport sys\nsys.stdout.write('Content-Type: text/plain\\n\\n'); sys.stdout.flush()\nprint(len(sys.stdin.buffer.read()))\n")
+        script("slow_ok", sh + "sleep 0.7; printf 'Content-Type: text/plain\\n\\nok'\n")
+        os.symlink("env", Path(d, "link"))
+
+    @classmethod
+    def make_conf(cls):
+        return f"route * /cgi/ cgi {cls.www}\ntimeout_cgi 1500ms\nmax_cgi 4\n"
+
+    def test_environment(self):
+        st, _, body, _ = self.s.get("/cgi/env/a%20b/c?x=1&y=2", headers=[("X-One", "1"), ("Proxy", "http://evil"), ("Authorization", "secret"), ("A_B", "z")])
+        env = dict(x.split("=", 1) for x in body.decode().splitlines() if "=" in x)
+        self.assertEqual(st, 200)
+        for k, v in {"REQUEST_METHOD": "GET", "QUERY_STRING": "x=1&y=2", "SCRIPT_NAME": "/cgi/env", "PATH_INFO": "/a b/c",
+                     "REMOTE_ADDR": "127.0.0.1", "SERVER_PORT": str(self.s.port), "GATEWAY_INTERFACE": "CGI/1.1", "HTTP_X_ONE": "1", "args": "0"}.items():
+            self.assertEqual(env.get(k), v, k)
+        for k in ("HTTP_PROXY", "HTTP_AUTHORIZATION", "HOME", "USER", "HTTP_A_B"):
+            self.assertNotIn(k, env)
+
+    def test_post_bodies(self):
+        for size in (0, 5, 70_000, 3_000_000):
+            data = os.urandom(size)
+            self.assertEqual(self.s.get("/cgi/echo", method="POST", body=data, timeout=10)[2], data)
+        # 머리를 먼저 내보내고 나서 본문을 읽는 프로그램
+        self.assertEqual(self.s.get("/cgi/head_first", method="POST", body=b"z" * 1_000_000, timeout=10)[2], b"1000000\n")
+
+    def test_headers(self):
+        st, h, body, _ = self.s.get("/cgi/status")
+        self.assertEqual((st, h["x-a"], body), (418, "b", b"hi"))
+        self.assertEqual(self.s.get("/cgi/redirect")[0], 302)
+        st, h, body, _ = self.s.get("/cgi/length")
+        self.assertEqual((h["content-length"], body), ("5", b"hello"))
+        out, end = self.s.raw(b"GET /cgi/short HTTP/1.1\r\n" + H + b"\r\n")
+        self.assertIn(end, ("EOF", "RST"))
+
+    def test_failures(self):
+        for path, want in [("nohead", 500), ("empty", 500), ("badhead", 500), ("nointerp", 500), ("none", 404), ("noexec", 403),
+                           (".hidden", 403), ("link", 403), ("", 403)]:
+            self.assertEqual(self.s.get("/cgi/" + path)[0], want, path)
+        self.assertEqual(self.s.get("/cgi/env", method="PUT", body=b"x")[0], 405)
+
+    def running(self):
+        return int(subprocess.run(f"pgrep -g $(pgrep -P {self.s.p.pid} | tr '\\n' ',' | sed 's/,$//') 2>/dev/null | wc -l", shell=True, capture_output=True).stdout)
+
+    def test_timeout_kills_the_whole_family(self):
+        t = time.time()
+        self.assertEqual(self.s.get("/cgi/sleep", timeout=8)[0], 504)
+        self.assertLess(time.time() - t, 3)
+        time.sleep(0.8)
+        self.assertEqual(subprocess.run(["pgrep", "-P", str(self.s.p.pid)], capture_output=True).stdout, b"")
+
+    def test_client_leaving_kills_it(self):
+        c = socket.create_connection(("127.0.0.1", self.s.port))
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\1\0\0\0\0\0\0\0")
+        c.sendall(b"GET /cgi/sleep HTTP/1.1\r\n" + H + b"\r\n")
+        time.sleep(0.3)
+        c.close()
+        time.sleep(1)
+        self.assertEqual(subprocess.run(["pgrep", "-P", str(self.s.p.pid)], capture_output=True).stdout, b"")
+
+    def test_limit_and_recovery(self):
+        res = []
+        ts = [threading.Thread(target=lambda: res.append(self.s.get("/cgi/slow_ok", timeout=10)[0])) for _ in range(10)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual((res.count(200), res.count(503)), (4, 6))
+        end = time.time() + 4
+        while self.s.get("/cgi/env")[0] != 200 and time.time() < end:
+            time.sleep(0.1)
+        self.assertLess(time.time(), end)
+
+    def test_child_gets_no_other_fds(self):
+        cs = [socket.create_connection(("127.0.0.1", self.s.port)) for _ in range(20)]
+        self.assertEqual(self.s.get("/cgi/fds")[2], b"")
+        for c in cs:
+            c.close()
+
+    def test_head(self):
+        st, _, body, _ = self.s.get("/cgi/status", method="HEAD")
+        self.assertEqual((st, body), (418, b""))
+
+
+class Observe(Case):
+    @classmethod
+    def files(cls, d):
+        Path(d, "index.html").write_text("hello")
+
+    def test_status_page_only_on_admin_port(self):
+        self.assertEqual(self.s.get("/status.json")[0], 404)
+        out, _ = self.s.raw(b"GET /status.json HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n", port=self.s.admin)
+        import json
+        st, _, body = parse(out)
+        j = json.loads(body)
+        self.assertEqual((st, len(j["loops"])), (200, 3))
+        self.assertEqual(statuses(self.s.raw(b"GET / HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n", port=self.s.admin)[0]), [200])
+        self.assertEqual(statuses(self.s.raw(b"POST / HTTP/1.1\r\n" + H + b"Content-Length: 0\r\nConnection: close\r\n\r\n", port=self.s.admin)[0]), [405])
+
+    def test_connections_are_spread_over_loops(self):
+        import json
+        for _ in range(30):
+            self.s.get("/")
+        out, _ = self.s.raw(b"GET /status.json HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n", port=self.s.admin)
+        got = [x["accepted"] for x in json.loads(parse(out)[2])["loops"]]
+        self.assertGreater(min(got), 5, got)
+
+    def test_access_log(self):
+        self.s.get("/index.html?token=secret")
+        self.s.raw(b"garbage\r\n\r\n")
+        time.sleep(0.5)
+        log = Path(self.s.dir, "access.log").read_text()
+        self.assertRegex(log, r'127\.0\.0\.1 "GET /index.html" 200 5 \d+ms')
+        self.assertIn(" 400 ", log)
+        self.assertNotIn("secret", log)
+
+    def test_blocked_log_does_not_block_the_server(self):
+        r, w = os.pipe()
+        with tempfile.TemporaryDirectory() as d:
+            port = free_port()
+            p = subprocess.Popen([BIN, "-p", str(port), "-r", self.www], stderr=w)
+            os.close(w)
+            try:
+                time.sleep(0.5)
+                one = b"GET /index.html HTTP/1.1\r\n" + H + b"\r\n"
+                c = socket.create_connection(("127.0.0.1", port))
+                c.settimeout(10)
+                n = 0
+                for _ in range(60):  # 로그를 읽지 않는 파이프가 꽉 차도 응답은 계속 나와야 한다
+                    c.sendall(one * 50)
+                    while n < 50:
+                        n += c.recv(1 << 20).count(b"200 OK")
+                    n = 0
+                c.close()
+            finally:
+                os.close(r)
+                p.terminate()
+                p.wait(5)
+
+
 # ---- 과부하, 제한 시간, 종료 ----
 
 class Limits(unittest.TestCase):

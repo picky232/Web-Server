@@ -83,6 +83,8 @@ static bool parse_pool(struct config *c, char **t, int n, char *err, size_t cap)
 {
     if (n < 2 || strlen(t[1]) >= sizeof c->pools[0].name)
         return fail(err, cap, "pool: 이름이 필요합니다");
+    if (strspn(t[1], "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(t[1]))
+        return fail(err, cap, "pool: 이름에는 영문, 숫자, _, - 만 쓸 수 있습니다: %s", t[1]);
     if (find_pool(c, t[1]))
         return fail(err, cap, "pool %s: 이미 있는 이름입니다", t[1]);
     if (c->npools == (int)(sizeof c->pools / sizeof c->pools[0]))

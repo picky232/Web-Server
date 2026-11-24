@@ -209,6 +209,8 @@ static void connect_next(struct conn *c)
             return;
         }
         px->be = b;
+        ex->tries++;
+        snprintf(ex->served_by, sizeof ex->served_by, "%s/%s", px->pool->name, b->name);
         px->tried |= 1u << (b - px->pool->be);
         px->fail_status = 502;
         atomic_fetch_add(&b->requests, 1);

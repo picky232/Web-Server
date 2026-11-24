@@ -2,8 +2,10 @@
 #include "conn.h"
 #include "loop.h"
 #include "route.h"
+#include "log.h"
 #include "server.h"
 #include "static.h"
+#include "status.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +27,7 @@ void exchange_free(struct conn *c)
     if (!ex)
         return;
     stop_handler(c);
+    log_access(c);
     spool_free(&ex->body);
     free(ex->head);
     free(ex->path);
@@ -70,28 +73,12 @@ void exchange_error(struct conn *c, int status, const char *extra)
     }
 }
 
-/* 아직 만들지 않은 칸: 어디로 갈 요청인지만 알려 준다 */
-static void todo_start(struct conn *c)
-{
-    struct exchange *ex = c->ex;
-    char body[512];
-    const struct route *r = ex->route;
-    int n = snprintf(body, sizeof body, "%s %s로 갈 요청: path=%s body=%lld\n",
-                     r->act == ACT_PROXY ? "proxy" : "cgi", r->pool ? r->pool->name : r->dir,
-                     strlen(ex->path) < 300 ? ex->path : "(긴 경로)", ex->body.size);
-    if (reply_text(&ex->reply, &c->out, 200, "text/plain; charset=utf-8", body, (size_t)n, NULL))
-        exchange_finish(c);
-    else
-        exchange_abort(c);
-}
-static const struct handler todo_handler = {.name = "todo", .start = todo_start};
-
 static const struct handler *handler_for(const struct route *r)
 {
     switch (r->act) {
     case ACT_STATIC: return &static_handler;
     case ACT_PROXY: return &proxy_handler;
-    case ACT_CGI: return &todo_handler;
+    case ACT_CGI: return &cgi_handler;
     }
     return NULL;
 }
@@ -144,7 +131,12 @@ static void decide(struct conn *c, int status)
     if (status == 0 && r->expect_other)
         status = 417;
     const char *allow = NULL;
-    if (status == 0) {
+    if (status == 0 && c->origin == ORIGIN_ADMIN) {
+        if (r->method != M_GET && r->method != M_HEAD) {
+            status = 405;
+            allow = "Allow: GET, HEAD\r\n";
+        }
+    } else if (status == 0) {
         ex->route = route_find(cfg, ex->host, ex->path);
         if (!ex->route)
             status = 404;
@@ -157,7 +149,7 @@ static void decide(struct conn *c, int status)
         exchange_error(c, status, allow);
         return;
     }
-    ex->h = handler_for(ex->route);
+    ex->h = c->origin == ORIGIN_ADMIN ? &status_handler : handler_for(ex->route);
     if (ex->dec.done)
         start_handler(c);
     else
