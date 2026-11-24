@@ -1,7 +1,6 @@
 #include "loop.h"
 #include "cgi.h"
 #include "conn.h"
-#include "forward.h"
 #include "log.h"
 #include "server.h"
 #include "str.h"
@@ -86,10 +85,6 @@ static void read_mail(struct loop *l)
         for (size_t i = 0; i < (size_t)n / sizeof *m; i++) {
             switch (m[i].type) {
             case MSG_CONN: conn_open(l, m[i].fd, m[i].origin, &m[i].peer); break;
-            case MSG_RESOLVED:
-                forward_resolved(m[i].ptr);
-                free(m[i].ptr);
-                break;
             case MSG_WAKE: break;
             }
         }

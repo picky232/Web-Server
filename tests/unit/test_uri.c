@@ -40,7 +40,6 @@ void test_uri(void)
     CHECK(uri_split(sl("/a#b"), M_GET, &g) == 400);
 
     CHECK(uri_split(sl("h:443"), M_CONNECT, &g) == 0 && sl_eq(g.authority, "h:443"));
-    CHECK(uri_split(sl("h"), M_CONNECT, &g) == 400 && uri_split(sl("h:"), M_CONNECT, &g) == 400);
     CHECK(uri_split(sl("http://h"), M_OPTIONS, &g) == 0 && g.asterisk);
 
     char host[64];

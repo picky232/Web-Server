@@ -13,7 +13,7 @@ int supervisor_run(struct config *cfg, char **argv);
 /* 워커 쪽: 감독이 넘겨준 fd들. 감독 없이 실행됐으면 n = 0 */
 struct inherited {
     int n;      /* listen 소켓 수 */
-    int fd[3];  /* web, admin, forward 순서 */
+    int fd[2];  /* web, admin 순서 */
     int alive;  /* 감독이 죽으면 EOF가 되는 파이프. 없으면 -1 */
     int ready;  /* 준비가 끝나면 한 바이트를 쓰는 파이프. 없으면 -1 */
 };

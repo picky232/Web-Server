@@ -1,6 +1,5 @@
 #include "exchange.h"
 #include "conn.h"
-#include "forward.h"
 #include "loop.h"
 #include "route.h"
 #include "log.h"
@@ -101,49 +100,15 @@ static void start_handler(struct conn *c)
     c->ex->h->start(c);
 }
 
-static int copy_path(struct exchange *ex, bool normalize)
+static int copy_path(struct exchange *ex)
 {
     struct sl p = ex->target.path;
     ex->path = calloc(1, p.n + 8); /* 정리에 실패해도 항상 끝이 있는 문자열이어야 로그에 쓸 수 있다 */
-    if (!ex->path)
-        return 500;
-    if (normalize)
-        return uri_normalize(p, ex->path, p.n + 8);
-    sl_copy(p, ex->path, p.n + 8); /* 포워드 프록시는 남의 서버 경로를 고치지 않는다 */
-    return 0;
+    return ex->path ? uri_normalize(p, ex->path, p.n + 8) : 500;
 }
 
-static bool port_allowed(const struct config *cfg, int port)
-{
-    for (int i = 0; i < cfg->nconnect_ports; i++)
-        if (cfg->connect_ports[i] == port)
-            return true;
-    return false;
-}
-
-/* 포워드 프록시 포트로 온 요청 */
-static int decide_forward(struct conn *c)
-{
-    struct exchange *ex = c->ex;
-    const struct config *cfg = c->loop->srv->cfg;
-    bool connect = ex->req.method == M_CONNECT;
-    if (connect || ex->req.minor == 0) /* HTTP/1.0 클라이언트와는 연결을 유지하지 않는다 (RFC 9112 9.3) */
-        ex->reply.keep = false;
-    if (!connect && !ex->target.absolute)
-        return 400; /* 프록시에게는 목적지까지 적어서 보내야 한다 */
-    if (ex->req.expect_100) /* 본문을 먼저 다 받는 구조라 "머리 먼저 전달"을 지킬 수 없다 → 최종 응답으로 끝낸다 */
-        return 417;
-    if (connect && !port_allowed(cfg, ex->port))
-        return 403;
-    int status = connect ? 0 : copy_path(ex, false);
-    if (!status && !connect && ex->target.asterisk)
-        strcpy(ex->path, "*");
-    ex->h = connect ? &tunnel_handler : &forward_handler;
-    return status;
-}
-
-/* 관리 포트와 일반 포트로 온 요청 */
-static int decide_local(struct conn *c, const char **allow)
+/* 규칙에서 처리할 쪽을 고른다 */
+static int choose(struct conn *c, const char **allow)
 {
     struct exchange *ex = c->ex;
     enum http_method m = ex->req.method;
@@ -151,7 +116,7 @@ static int decide_local(struct conn *c, const char **allow)
         ex->reply.keep = false; /* 터널이라고 믿은 바이트가 다음 요청으로 읽히면 안 된다 */
         return 501;
     }
-    int status = copy_path(ex, true);
+    int status = copy_path(ex);
     if (status)
         return status;
     if (c->origin == ORIGIN_ADMIN) {
@@ -187,12 +152,12 @@ static void decide(struct conn *c, int status)
         status = uri_host(authority, 80, ex->host, sizeof ex->host, &ex->port);
     /* 서버 전체에 대한 OPTIONS, 또는 "여기까지만 전달"(Max-Forwards: 0)이면 직접 답한다 */
     const struct field *hops = r->method == M_OPTIONS ? fields_find(&r->h, "Max-Forwards") : NULL;
-    if (status == 0 && ((ex->target.asterisk && c->origin != ORIGIN_FORWARD) || (hops && sl_eq(hops->value, "0")))) {
+    if (status == 0 && (ex->target.asterisk || (hops && sl_eq(hops->value, "0")))) {
         exchange_error(c, 204, "Allow: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS\r\n");
         return;
     }
     if (status == 0)
-        status = c->origin == ORIGIN_FORWARD ? decide_forward(c) : decide_local(c, &allow);
+        status = choose(c, &allow);
     if (status == 0 && r->expect_other)
         status = 417;
     if (status == 0 && r->length > cfg->max_body)

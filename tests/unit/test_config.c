@@ -71,19 +71,6 @@ void test_config(void)
     CHECK(!strcmp(find(c, "h", "/only/x"), "a") && !strcmp(find(c, "h", "/other"), "b"));
     config_free(c);
 
-    static const struct {
-        const char *ip;
-        bool priv;
-    } ips[] = {{"127.0.0.1", true}, {"10.1.2.3", true}, {"172.16.0.1", true}, {"172.32.0.1", false}, {"192.168.0.1", true},
-               {"169.254.169.254", true}, {"100.64.0.1", true}, {"0.0.0.0", true}, {"224.0.0.1", true}, {"8.8.8.8", false},
-               {"::1", true}, {"::", true}, {"fe80::1", true}, {"fd00::1", true}, {"::ffff:10.0.0.1", true}, {"::ffff:8.8.8.8", false},
-               {"2001:4860:4860::8888", false}, {"ff02::1", true}, {"64:ff9b::a00:1", true}};
-    for (size_t i = 0; i < sizeof ips / sizeof ips[0]; i++) {
-        struct addr a;
-        CHECK(net_parse_hostport(ips[i].ip, "80", true, &a));
-        CHECK_MSG(net_is_private(&a) == ips[i].priv, ips[i].ip);
-    }
-
     static const char *mimes[][2] = {
         {"/a.html", "text/html; charset=utf-8"}, {"/a.HTML", "text/html; charset=utf-8"}, {"/a.css", "text/css; charset=utf-8"},
         {"/a.js", "text/javascript; charset=utf-8"}, {"/a.png", "image/png"}, {"/a.jpg", "image/jpeg"}, {"/a.JPEG", "image/jpeg"},

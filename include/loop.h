@@ -14,13 +14,12 @@ struct idle_list;
 struct child;
 
 /* 메인 스레드가 루프 스레드에 보내는 쪽지. 파이프로 통째로 전달된다 (512바이트 이하는 쪼개지지 않음) */
-enum msg_type { MSG_CONN, MSG_RESOLVED, MSG_WAKE };
+enum msg_type { MSG_CONN, MSG_WAKE };
 struct msg {
     enum msg_type type;
     int fd;
     int origin; /* 어느 listen 소켓으로 들어왔나 (enum origin) */
     struct addr peer;
-    void *ptr; /* MSG_RESOLVED: 이름 해석 결과 */
 };
 
 /* 이벤트 루프 하나 = 스레드 하나. 이 안의 값은 atomic을 빼면 그 스레드만 만진다 → 락이 없다 */

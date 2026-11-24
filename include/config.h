@@ -19,8 +19,8 @@ struct route {
 
 /* 시작할 때 한 번 채우고 그 뒤로는 읽기만 한다 → 모든 스레드가 락 없이 같이 쓴다 */
 struct config {
-    struct addr listen, admin, forward;
-    bool has_admin, has_forward;
+    struct addr listen, admin;
+    bool has_admin;
     bool supervise; /* -s: 감독 프로세스로 실행 */
     int loops; /* 0 = 코어 수 */
     int max_connections;
@@ -28,7 +28,6 @@ struct config {
     int max_cgi;
     int min_rate; /* 이보다 느리게(초당 바이트) 보내거나 받는 연결은 끊는다 */
     int head_ms, idle_ms, connect_ms, response_ms, stall_ms, drain_ms, cgi_ms, health_ms;
-    int connect_ports[8], nconnect_ports; /* 포워드 프록시의 CONNECT가 허용하는 포트 */
     char access_log[512]; /* 빈 문자열 = 끔, "-" = 표준 오류 */
     struct pool pools[16];
     int npools, nbackends;

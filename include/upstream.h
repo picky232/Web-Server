@@ -5,7 +5,6 @@
 #include "body.h"
 #include "buf.h"
 #include "ev.h"
-#include "resolver.h"
 
 struct conn;
 struct loop;
@@ -51,19 +50,10 @@ struct proxy_st {
     struct cached *saving; /* 응답을 중계하면서 같이 모으는 캐시 사본 */
     size_t saving_cap;
     unsigned cache_gen;
-    /* 포워드 프록시: 백엔드 묶음 대신 이름 해석 결과로 접속한다 */
-    struct resolve *asking; /* 이름 해석을 기다리는 중 */
-    struct addr addr[RESOLVE_MAX];
-    int naddr, next_addr;
-    bool half_closed;
 };
 
 extern const struct handler proxy_handler;
 extern const struct handler cache_handler; /* 저장해 둔 응답을 내보낸다 */
-
-bool upstream_is_loop(const struct conn *c);       /* Via에 내 이름이 있다 = 나에게 되돌아온 요청 */
-void upstream_connect_addrs(struct conn *c);      /* px->addr의 주소들에 차례로 접속 */
-void upstream_next_addr(struct conn *c, int err); /* 이번 주소는 실패. 다음 주소로 */
 
 void upstream_event(struct upconn *up); /* 백엔드 소켓에 일이 생겼다 */
 void upstream_scan(struct loop *l);     /* 오래 쉰 연결 정리 */
@@ -73,8 +63,7 @@ struct upconn *upconn_open(struct loop *l, const struct addr *a, struct backend 
 struct upconn *upconn_reuse(struct loop *l, struct backend *b);                     /* 보관함에서 꺼낸다. 없으면 NULL */
 void upconn_keep(struct upconn *up);                                                /* 보관함에 넣는다 */
 
-/* 시험할 수 있게 떼어 둔 순수 함수: 클라이언트 요청 → 백엔드로 보낼 요청 머리.
-   ip가 NULL이면 포워드 프록시: X-Forwarded-*를 더하지도 지우지도 않는다 */
+/* 시험할 수 있게 떼어 둔 순수 함수: 클라이언트 요청 → 백엔드로 보낼 요청 머리 */
 struct exchange;
 bool upstream_request_head(const struct exchange *ex, const char *ip, const char *via,
                            const char *default_host, struct buf *out);

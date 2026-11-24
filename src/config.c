@@ -26,7 +26,6 @@ void config_defaults(struct config *c)
     c->drain_ms = 10000;
     c->cgi_ms = 10000;
     c->health_ms = 2000;
-    c->connect_ports[c->nconnect_ports++] = 443;
     strcpy(c->access_log, "-");
 }
 
@@ -190,16 +189,6 @@ bool config_line(struct config *c, char *line, char *err, size_t cap)
         return parse_pool(c, t, n, err, cap);
     if (!strcmp(t[0], "route"))
         return parse_route(c, t, n, err, cap);
-    if (!strcmp(t[0], "forward_connect_ports")) {
-        c->nconnect_ports = 0;
-        for (int i = 1; i < n; i++) {
-            long long p;
-            if (i > 8 || !parse_size(t[i], 1, 65535, &p))
-                return fail(err, cap, "%s: 잘못된 포트입니다: %s", t[0], t[i]);
-            c->connect_ports[c->nconnect_ports++] = (int)p;
-        }
-        return true;
-    }
     if (n != 2)
         return fail(err, cap, "%s: 값 하나가 필요합니다", t[0]);
 
@@ -222,8 +211,6 @@ bool config_line(struct config *c, char *line, char *err, size_t cap)
         ok = net_parse_addr(t[1], &c->listen);
     } else if (!strcmp(t[0], "admin")) {
         ok = c->has_admin = net_parse_addr(t[1], &c->admin);
-    } else if (!strcmp(t[0], "forward")) {
-        ok = c->has_forward = net_parse_addr(t[1], &c->forward);
     } else if (!strcmp(t[0], "loops")) {
         ok = !strcmp(t[1], "auto") || parse_size(t[1], 1, 256, &v);
         c->loops = (int)v;

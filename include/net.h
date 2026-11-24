@@ -12,7 +12,6 @@ struct addr {
 
 /* "127.0.0.1:8080", "[::1]:8080", "localhost:8080" → 주소. DNS를 쓸 수 있으므로 시작할 때만 부른다 */
 bool net_parse_addr(const char *s, struct addr *out);
-bool net_parse_hostport(const char *host, const char *port, bool numeric, struct addr *out);
 
 int net_listen(const struct addr *a);                 /* socket → SO_REUSEADDR → bind → listen */
 int net_accept(int lfd, struct addr *peer);           /* 안 기다리는 소켓으로 돌려준다 */
@@ -27,7 +26,5 @@ void net_ip(const struct addr *a, char *out, size_t cap);
 int net_port(const struct addr *a);
 int net_local_port(int fd);
 bool net_is_bound_to(int fd, const struct addr *a); /* fd가 정말 그 주소에서 듣고 있나 (포트 0은 아무 포트) */
-bool net_is_loopback(const struct addr *a);
-bool net_is_private(const struct addr *a); /* 바깥에서 닿으면 안 되는 내부·특수 주소 */
 
 #endif

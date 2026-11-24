@@ -33,7 +33,7 @@ struct inherited supervisor_inherit(void)
         return in;
     in.n = atoi(v);
     unsetenv(ENV_NAME); /* CGI 자식까지 내려가지 않게 */
-    if (in.n < 1 || in.n > 3) {
+    if (in.n < 1 || in.n > 2) {
         in.n = 0;
         return in;
     }
@@ -60,7 +60,7 @@ static void on_signal(int sig)
 
 struct sup {
     char **argv;
-    int door[3], ndoors;
+    int door[2], ndoors;
     int alive[2];
     pid_t current, starting, old[MAX_OLD];
     int nold;
@@ -202,12 +202,10 @@ static void stop_all(struct sup *s)
 
 static int open_doors(struct sup *s, const struct config *cfg)
 {
-    const struct addr *a[3] = {&cfg->listen};
+    const struct addr *a[2] = {&cfg->listen};
     int n = 1;
     if (cfg->has_admin)
         a[n++] = &cfg->admin;
-    if (cfg->has_forward)
-        a[n++] = &cfg->forward;
     for (int i = 0; i < n; i++) {
         int fd = net_listen(a[i]);
         if (fd < 0) {

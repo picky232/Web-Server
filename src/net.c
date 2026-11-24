@@ -24,13 +24,13 @@ void net_nodelay(int fd)
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 }
 
-bool net_parse_hostport(const char *host, const char *port, bool numeric, struct addr *out)
+static bool resolve(const char *host, const char *port, struct addr *out)
 {
     struct addrinfo hints, *res;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_NUMERICSERV | (numeric ? AI_NUMERICHOST : 0);
+    hints.ai_flags = AI_NUMERICSERV;
     if (getaddrinfo(host, port, &hints, &res) != 0)
         return false;
     memset(out, 0, sizeof *out);
@@ -55,7 +55,7 @@ bool net_parse_addr(const char *s, struct addr *out)
         return false;
     memcpy(host, s, n);
     host[n] = '\0';
-    return net_parse_hostport(host, colon + 1, false, out);
+    return resolve(host, colon + 1, out);
 }
 
 int net_listen(const struct addr *a)
@@ -176,31 +176,4 @@ bool net_is_bound_to(int fd, const struct addr *a)
     net_ip(a, x, sizeof x);
     net_ip(&b, y, sizeof y);
     return !strcmp(x, y) && (net_port(a) == 0 || net_port(a) == net_port(&b));
-}
-
-bool net_is_loopback(const struct addr *a)
-{
-    if (a->ss.ss_family == AF_INET6)
-        return IN6_IS_ADDR_LOOPBACK(&((const struct sockaddr_in6 *)&a->ss)->sin6_addr);
-    return (ntohl(((const struct sockaddr_in *)&a->ss)->sin_addr.s_addr) >> 24) == 127;
-}
-
-static bool private_v4(unsigned ip)
-{
-    unsigned a = ip >> 24, b = (ip >> 16) & 255;
-    return a == 0 || a == 10 || a == 127 || a >= 224 || (a == 100 && b >= 64 && b < 128) || (a == 169 && b == 254) ||
-           (a == 172 && b >= 16 && b < 32) || (a == 192 && b == 168) || (a == 198 && (b == 18 || b == 19));
-}
-
-bool net_is_private(const struct addr *a)
-{
-    if (a->ss.ss_family == AF_INET)
-        return private_v4(ntohl(((const struct sockaddr_in *)&a->ss)->sin_addr.s_addr));
-    const unsigned char *p = ((const struct sockaddr_in6 *)&a->ss)->sin6_addr.s6_addr;
-    static const unsigned char zero[12];
-    static const unsigned char mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
-    if (!memcmp(p, mapped, 12) || !memcmp(p, zero, 12)) /* ::ffff:10.0.0.1 처럼 감싼 IPv4, ::, ::1 */
-        return !memcmp(p, zero, 12) || private_v4((unsigned)p[12] << 24 | (unsigned)p[13] << 16 | (unsigned)p[14] << 8 | p[15]);
-    return (p[0] & 0xfe) == 0xfc || (p[0] == 0xfe && (p[1] & 0xc0) == 0x80) || p[0] == 0xff ||
-           (p[0] == 0x00 && p[1] == 0x64 && p[2] == 0xff && p[3] == 0x9b); /* IPv4로 다시 풀리는 64:ff9b:: */
 }

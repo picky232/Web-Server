@@ -40,21 +40,18 @@ bool upstream_request_head(const struct exchange *ex, const char *ip, const char
     for (int i = 0; ok && i < r->h.n; i++) {
         const struct field *f = &r->h.f[i];
         bool skip = fields_hop_by_hop(&r->h, f->name);
-        size_t nrewritten = ip ? sizeof rewritten / sizeof rewritten[0] : 3;
-        for (size_t k = 0; !skip && k < nrewritten; k++)
+        for (size_t k = 0; !skip && k < sizeof rewritten / sizeof rewritten[0]; k++)
             skip = sl_eqi(f->name, rewritten[k]);
         /* X_Forwarded_For는 백엔드에서 X-Forwarded-For와 같은 환경 변수가 되어 위조에 쓰인다 */
-        skip = skip || (ip && memchr(f->name.p, '_', f->name.n));
+        skip = skip || memchr(f->name.p, '_', f->name.n);
         long long hops;
         if (!skip && r->method == M_OPTIONS && sl_eqi(f->name, "Max-Forwards") && sl_to_ll(f->value, &hops))
             ok = buf_printf(out, "Max-Forwards: %lld\r\n", hops - 1);
         else if (!skip)
             ok = put(out, f->name, f->value);
     }
-    ok = ok && buf_printf(out, "Via: 1.1 %s\r\n", via);
-    if (ok && ip)
-        ok = buf_printf(out, "X-Forwarded-For: %s\r\nX-Forwarded-Proto: http\r\n", ip) &&
-             put(out, (struct sl){"X-Forwarded-Host", 16}, host);
+    ok = ok && buf_printf(out, "Via: 1.1 %s\r\nX-Forwarded-For: %s\r\nX-Forwarded-Proto: http\r\n", via, ip) &&
+         put(out, (struct sl){"X-Forwarded-Host", 16}, host);
     /* 본문은 이미 다 받았으므로 chunked로 왔더라도 길이를 안다 */
     if (ok && (ex->body.size || r->method == M_POST || r->method == M_PUT || r->method == M_PATCH))
         ok = buf_printf(out, "Content-Length: %lld\r\n", ex->body.size);
@@ -66,12 +63,6 @@ bool upstream_request_head(const struct exchange *ex, const char *ip, const char
 static struct proxy_st *px_of(struct conn *c)
 {
     return &c->ex->u.proxy;
-}
-
-/* 두 문은 이름이 다르다. 포워드로 들어온 요청이 우리 리버스 프록시를 거치는 것은 순환이 아니다 */
-static const char *via_name(const struct conn *c)
-{
-    return c->origin == ORIGIN_FORWARD ? c->loop->srv->via_forward : c->loop->srv->via;
 }
 
 /* 요청을 다시 보내도 두 번 처리될 위험이 없는가 */
@@ -105,16 +96,8 @@ static void fail(struct conn *c, int status, enum outcome o)
     exchange_error(c, status, status == 503 ? "Retry-After: 1\r\n" : NULL);
 }
 
-static bool open_up(struct conn *c, const struct addr *a, struct backend *b)
-{
-    struct proxy_st *px = px_of(c);
-    px->up = upconn_open(c->loop, a, b);
-    px->connecting = px->up != NULL;
-    return px->up != NULL;
-}
-
 /* 연결이 생겼다(또는 시작했다). 요청 머리를 준비한다 */
-static void prepare(struct conn *c, const char *ip, const char *default_host)
+static void prepare(struct conn *c)
 {
     struct exchange *ex = c->ex;
     struct proxy_st *px = px_of(c);
@@ -122,11 +105,10 @@ static void prepare(struct conn *c, const char *ip, const char *default_host)
     px->up->c = c;
     px->body_off = 0;
     px->scanned = 0;
-    px->send_broken = px->eof = false;
+    px->send_broken = px->eof = px->broken = false;
     px->touched = c->loop->now;
     ex->deadline = c->loop->now + (px->connecting ? cfg->connect_ms : cfg->response_ms);
-    if (ex->req.method != M_CONNECT &&
-        !upstream_request_head(ex, ip, via_name(c), default_host, &px->up->out))
+    if (!upstream_request_head(ex, c->ip, c->loop->srv->via, px->be->name, &px->up->out))
         fail(c, 431, OUT_NEUTRAL);
 }
 
@@ -135,10 +117,6 @@ static void connect_next(struct conn *c)
 {
     struct exchange *ex = c->ex;
     struct proxy_st *px = px_of(c);
-    if (!px->pool) {
-        upstream_next_addr(c, 0);
-        return;
-    }
     for (;;) {
         struct backend *b = c->loop->now < px->give_up ? pool_pick(px->pool, px->tried, c->loop->now) : NULL;
         if (!b) {
@@ -151,12 +129,12 @@ static void connect_next(struct conn *c)
         px->tried |= 1u << (b - px->pool->be);
         px->fail_status = 502;
         atomic_fetch_add(&b->requests, 1);
-        px->connecting = false;
         /* 보관된 연결은 하필 닫히는 중일 수 있다. 다시 보내도 되는 요청(GET·HEAD)만 쓴다 */
         px->up = px->fresh || !retry_safe(ex) ? NULL : upconn_reuse(c->loop, b);
+        px->connecting = !px->up;
         if (px->up) {
             atomic_fetch_add(&b->reused, 1);
-        } else if (!open_up(c, &b->addr, b)) {
+        } else if (!(px->up = upconn_open(c->loop, &b->addr, b))) {
             int e = errno;
             /* 포트·fd·메모리 부족은 우리 사정이다. 백엔드 장애로 세면 멀쩡한 백엔드가 모두 빠진다 */
             bool ours = e == EMFILE || e == ENFILE || e == ENOBUFS || e == ENOMEM || e == EADDRNOTAVAIL;
@@ -167,42 +145,20 @@ static void connect_next(struct conn *c)
             release(c, OUT_REFUSED, false);
             continue;
         }
-        prepare(c, c->ip, b->name);
+        prepare(c);
         return;
     }
 }
 
-void upstream_next_addr(struct conn *c, int err)
-{
-    struct proxy_st *px = px_of(c);
-    if (err)
-        px->fail_status = err == ETIMEDOUT ? 504 : 502;
-    release(c, OUT_NEUTRAL, false);
-    while (px->next_addr < px->naddr && c->loop->now < px->give_up) {
-        if (!open_up(c, &px->addr[px->next_addr++], NULL))
-            continue;
-        prepare(c, NULL, c->ex->host);
-        return;
-    }
-    fail(c, px->fail_status, OUT_NEUTRAL);
-}
-
-void upstream_connect_addrs(struct conn *c)
-{
-    struct proxy_st *px = px_of(c);
-    px->give_up = c->loop->now + 3LL * c->loop->srv->cfg->connect_ms;
-    px->fail_status = 502;
-    upstream_next_addr(c, 0);
-}
-
-bool upstream_is_loop(const struct conn *c)
+/* Via에 내 이름이 있다 = 나에게 되돌아온 요청 */
+static bool is_loop(const struct conn *c)
 {
     const struct fields *h = &c->ex->req.h;
     for (int i = 0; i < h->n; i++) {
         if (!sl_eqi(h->f[i].name, "Via"))
             continue;
         char me[96]; /* "1.1 이름" 조각이 정확히 같은지. 앞부분만 같은 다른 서버를 나로 착각하지 않게 */
-        snprintf(me, sizeof me, "1.1 %s", via_name(c));
+        snprintf(me, sizeof me, "1.1 %s", c->loop->srv->via);
         if (sl_list_has(h->f[i].value, me))
             return true;
     }
@@ -214,7 +170,7 @@ static void proxy_start(struct conn *c)
     struct exchange *ex = c->ex;
     struct proxy_st *px = px_of(c);
     memset(px, 0, sizeof *px);
-    if (upstream_is_loop(c)) { /* 그대로 두면 연결이 다 찰 때까지 돈다 */
+    if (is_loop(c)) { /* 그대로 두면 연결이 다 찰 때까지 돈다 */
         exchange_error(c, 508, NULL);
         return;
     }
@@ -295,7 +251,7 @@ static bool recv_response(struct conn *c)
 static void lost_before_response(struct conn *c)
 {
     struct proxy_st *px = px_of(c);
-    bool nothing = px->pool && !buf_len(&px->up->in) && !px->interim;
+    bool nothing = !buf_len(&px->up->in) && !px->interim;
     bool reused = px->up->reused;
     if (nothing && reused && retry_safe(c->ex) && !px->fresh) {
         /* 쉬던 연결이 하필 닫히던 중이었다. 백엔드 잘못이 아니므로 새 연결로 다시 */
@@ -340,7 +296,7 @@ static bool start_reply(struct conn *c, const struct http_res *res)
                           : res->length >= 0 ? BODY_LENGTH : BODY_EOF;
     body_init(&px->dec, kind, res->length);
     /* HEAD에 본문을 붙여 보내는 백엔드가 있다. 그 본문이 늦게 오면 다음 손님의 응답으로 읽히므로 다시 쓰지 않는다 */
-    px->reusable = px->pool && res->keep && res->minor >= 1 && kind != BODY_EOF && !ex->reply.head_only;
+    px->reusable = res->keep && res->minor >= 1 && kind != BODY_EOF && !ex->reply.head_only;
     px->bad_status = res->status == 502 || res->status == 503;
     px->head_done = true;
 
@@ -353,8 +309,7 @@ static bool start_reply(struct conn *c, const struct http_res *res)
     if (ok && caching_on(c))
         ok = buf_printf(&extra, "X-Cache: MISS\r\n");
     caching_invalidate(c, res->status);
-    ok = ok && (px->pool || buf_printf(&extra, "Via: 1.1 %s\r\n", via_name(c))) && /* 포워드 프록시의 의무 */
-              reply_start(&ex->reply, &c->out, res->status, res->length, buf_head(&extra), buf_len(&extra), flags);
+    ok = ok && reply_start(&ex->reply, &c->out, res->status, res->length, buf_head(&extra), buf_len(&extra), flags);
     buf_free(&extra);
     if (!ok)
         fail(c, 502, OUT_NEUTRAL);
@@ -461,10 +416,6 @@ static bool proxy_pump(struct conn *c)
         if (!(px->up->io.ready & IO_W))
             return false;
         int err = net_error(px->up->io.fd);
-        if (err && !px->pool) {
-            upstream_next_addr(c, err);
-            return true;
-        }
         if (err) {
             release(c, err == ETIMEDOUT ? OUT_CONNECT_TIMEOUT : OUT_REFUSED, false);
             connect_next(c);
@@ -519,9 +470,7 @@ static void proxy_interest(struct conn *c)
 static void proxy_timeout(struct conn *c)
 {
     struct proxy_st *px = px_of(c);
-    if (px->connecting && !px->pool) {
-        upstream_next_addr(c, ETIMEDOUT);
-    } else if (px->connecting) {
+    if (px->connecting) {
         px->fail_status = 504;
         release(c, OUT_CONNECT_TIMEOUT, false);
         int keep = px->fail_status;

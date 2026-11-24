@@ -199,6 +199,8 @@ class Parsing(Case):
     def test_absolute_form_and_options(self):
         self.assertEqual(statuses(self.s.raw(b"GET http://any:1/ HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")[0]), [200])
         self.assertEqual(statuses(self.s.raw(b"OPTIONS * HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")[0]), [204])
+        self.assertEqual(statuses(self.s.raw(b"OPTIONS http://x HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")[0]), [204])
+        self.assertEqual(statuses(self.s.raw(b"OPTIONS / HTTP/1.1\r\n" + H + b"Max-Forwards: 0\r\nConnection: close\r\n\r\n")[0]), [204])
 
     def test_expect_never_after_final(self):
         # 예전 구현의 결함: 최종 응답 뒤에 100을 또 보냈다
@@ -769,105 +771,6 @@ class ProxyFailure(ProxyCase):
         self.assertEqual(s.get("/")[0], 503)
         c.close()  # RST
         time.sleep(0.2)
-        self.assertEqual(s.get("/")[0], 200)
-
-# ---- 포워드 프록시 ----
-
-class Forward(ProxyCase):
-    def start(self, script, conf=""):
-        self.b = [Backend(script)]
-        self.fport = free_port()
-        self.s = Server(f"forward 127.0.0.1:{self.fport}\nforward_connect_ports 443 {self.b[0].port}\nroute * / static {ROOT}/www\n{conf}")
-        return self.s
-
-    def via(self, *parts, **kw):
-        return self.s.raw(*parts, port=self.fport, **kw)
-
-    def test_get_and_post(self):
-        self.start(lambda sock, h, b: sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(b) + b))
-        to = f"localhost:{self.b[0].port}".encode()  # 이름 해석까지 거친다
-        out, end = self.via(b"POST http://" + to + b"/a%2Fb?q HTTP/1.1\r\nHost: ignored\r\nProxy-Connection: keep-alive\r\nX-Forwarded-For: 1.1.1.1\r\nContent-Length: 3\r\n\r\nabc", timeout=1)
-        self.assertEqual((statuses(out), end), ([200], "OPEN"))
-        self.assertTrue(out.endswith(b"abc"))
-        self.assertIn(b"Via: 1.1 jiho-webserver", out)
-        head = self.b[0].requests[0][0]
-        self.assertTrue(head.startswith(b"POST /a%2Fb?q HTTP/1.1\r\nHost: " + to), head)  # 남의 경로는 고치지 않는다
-        self.assertIn(b"Via: 1.1 jiho-webserver", head)
-        self.assertIn(b"X-Forwarded-For: 1.1.1.1", head)
-        self.assertNotIn(b"Proxy-Connection", head)
-
-    def test_rules(self):
-        s = self.start(ok())
-        for req, want in [(b"GET / HTTP/1.1\r\n" + H + b"\r\n", 400),
-                          (b"GET http://no-such-host.invalid/ HTTP/1.1\r\n" + H + b"\r\n", 502),
-                          (b"GET http://127.0.0.1:%d/ HTTP/1.1\r\n" % free_port() + H + b"\r\n", 502),
-                          (b"CONNECT 127.0.0.1:22 HTTP/1.1\r\n" + H + b"\r\n", 403),
-                          (b"POST http://127.0.0.1:%d/ HTTP/1.1\r\n" % self.b[0].port + H + b"Expect: 100-continue\r\nContent-Length: 1\r\n\r\n", 417),
-                          (b"CONNECT 127.0.0.1 HTTP/1.1\r\n" + H + b"\r\n", 400),
-                          (b"GET http://127.0.0.1:%d/ HTTP/1.1\r\n" % self.fport + H + b"\r\n", 400)]:
-            self.assertEqual(statuses(self.via(req, timeout=6)[0]), [want], req)
-        # 일반 포트는 열린 프록시가 아니다: 절대형 주소가 와도 내 규칙대로만 처리
-        out, _ = s.raw(b"GET http://127.0.0.1:%d/ HTTP/1.1\r\n" % self.b[0].port + H + b"Connection: close\r\n\r\n")
-        self.assertEqual((statuses(out), self.b[0].requests), ([200], []))
-        self.assertEqual(statuses(self.via(b"OPTIONS http://127.0.0.1:%d HTTP/1.1\r\n" % self.b[0].port + H + b"Connection: close\r\n\r\n")[0]), [200])
-        self.assertTrue(self.b[0].requests[-1][0].startswith(b"OPTIONS * HTTP/1.1"))
-        n = len(self.b[0].requests)
-        self.assertEqual(statuses(self.via(b"OPTIONS http://127.0.0.1:%d/ HTTP/1.1\r\n" % self.b[0].port + H + b"Max-Forwards: 0\r\nConnection: close\r\n\r\n")[0]), [204])
-        self.assertEqual(len(self.b[0].requests), n)
-        # HTTP/1.0 클라이언트와는 연결을 유지하지 않는다
-        self.assertEqual(self.via(b"GET http://127.0.0.1:%d/ HTTP/1.0\r\nConnection: keep-alive\r\n\r\n" % self.b[0].port)[1], "EOF")
-
-    def test_connect_tunnel(self):
-        ls = socket.socket()
-        ls.bind(("127.0.0.1", 0))
-        ls.listen()
-        port = ls.getsockname()[1]
-
-        def echo():
-            s, _ = ls.accept()
-            s.sendall(s.recv(3)[::-1])
-            while d := s.recv(65536):
-                s.sendall(d)
-            s.sendall(b"BYE")
-            s.close()
-        threading.Thread(target=echo, daemon=True).start()
-        self.start(ok(), f"forward_connect_ports {port}\n")
-        c = socket.create_connection(("127.0.0.1", self.fport))
-        c.settimeout(10)
-        c.sendall(b"CONNECT 127.0.0.1:%d HTTP/1.1\r\n" % port + H + b"\r\nabc")  # 응답을 기다리지 않고 보낸 바이트도 전달
-        got = b""
-        while not got.endswith(b"cba"):
-            got += c.recv(1000)
-        self.assertTrue(got.startswith(b"HTTP/1.1 200 "))
-        data = os.urandom(3_000_000)
-        threading.Thread(target=c.sendall, args=(data,), daemon=True).start()
-        back = b""
-        while len(back) < len(data):
-            back += c.recv(1 << 20)
-        self.assertEqual(hashlib.sha256(back).digest(), hashlib.sha256(data).digest())
-        c.shutdown(socket.SHUT_WR)  # 보내기만 닫아도 상대의 마지막 말은 들려야 한다
-        last = b""
-        while d := c.recv(1000):
-            last += d
-        self.assertEqual(last, b"BYE")
-        c.close()
-        ls.close()
-
-    def test_forward_to_our_own_reverse_proxy_is_not_a_loop(self):
-        b = Backend(ok(b"deep"))
-        self.start(ok(), f"pool q 127.0.0.1:{b.port}\nroute * /q proxy q\n")
-        out, _ = self.via(b"GET http://127.0.0.1:%d/q HTTP/1.1\r\n" % self.s.port + H + b"Connection: close\r\n\r\n")
-        self.assertTrue(statuses(out) == [200] and out.endswith(b"deep"), out)
-        b.stop()
-
-    def test_leaving_while_resolving(self):
-        s = self.start(ok())
-        for i in range(30):
-            c = socket.create_connection(("127.0.0.1", self.fport))
-            c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\1\0\0\0\0\0\0\0")
-            c.sendall(b"GET http://h%d.invalid/ HTTP/1.1\r\n" % i + H + b"\r\n")
-            c.close()
-        time.sleep(0.5)
         self.assertEqual(s.get("/")[0], 200)
 
 # ---- 캐시 ----

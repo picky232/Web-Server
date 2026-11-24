@@ -12,8 +12,7 @@ struct server {
     const struct config *cfg;
     struct loop *loops;
     int nloops;
-    char via[64], via_forward[64]; /* Via 헤더에 쓰는 내 이름. 문마다 다르다 */
-    bool forward_loopback; /* 포워드 프록시 문이 실제로 내 컴퓨터에만 열려 있나 */
+    char via[64]; /* Via 헤더에 쓰는 내 이름 */
     atomic_int loops_alive;
     atomic_int phase; /* enum phase. 메인이 바꾸고 루프가 매 바퀴 읽는다 */
     atomic_int cgi_running;
@@ -25,6 +24,6 @@ struct server {
 };
 
 /* 연결이 들어온 문 */
-enum origin { ORIGIN_WEB, ORIGIN_ADMIN, ORIGIN_FORWARD };
+enum origin { ORIGIN_WEB, ORIGIN_ADMIN };
 
 #endif

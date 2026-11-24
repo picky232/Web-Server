@@ -8,9 +8,9 @@ int uri_split(struct sl s, enum http_method m, struct target *t)
     memset(t, 0, sizeof *t);
     if (memchr(s.p, '#', s.n))
         return 400;
-    if (m == M_CONNECT) { /* 포트가 반드시 있어야 한다 */
+    if (m == M_CONNECT) { /* "호스트:포트" 모양. 터널은 만들지 않으므로 뒤에서 501로 거절한다 */
         t->authority = s;
-        return s.n && s.p[s.n - 1] >= '0' && s.p[s.n - 1] <= '9' && memchr(s.p, ':', s.n) ? 0 : 400;
+        return 0;
     }
     if (sl_eq(s, "*")) {
         t->asterisk = true;

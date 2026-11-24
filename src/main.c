@@ -1,7 +1,6 @@
 #include "health.h"
 #include "log.h"
 #include "net.h"
-#include "resolver.h"
 #include "server.h"
 #include "str.h"
 #include "supervisor.h"
@@ -223,19 +222,15 @@ int main(int argc, char **argv)
     g_spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
     setup_signals();
 
-    const struct addr *want[3] = {&cfg->listen};
-    int origins[3] = {ORIGIN_WEB}, ndoors = 1;
+    const struct addr *want[2] = {&cfg->listen};
+    int origins[2] = {ORIGIN_WEB}, ndoors = 1;
     if (cfg->has_admin) {
         want[ndoors] = &cfg->admin;
         origins[ndoors++] = ORIGIN_ADMIN;
     }
-    if (cfg->has_forward) {
-        want[ndoors] = &cfg->forward;
-        origins[ndoors++] = ORIGIN_FORWARD;
-    }
-    struct door doors[3];
+    struct door doors[2];
     if (in.n && in.n != ndoors) {
-        fprintf(stderr, "listen, admin, forward를 더하거나 빼려면 감독 프로세스를 다시 시작해야 합니다\n");
+        fprintf(stderr, "admin을 더하거나 빼려면 감독 프로세스를 다시 시작해야 합니다\n");
         return 2;
     }
     for (int k = 0; k < ndoors; k++) {
@@ -247,8 +242,6 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    if (cfg->has_forward && resolver_start(4) < 0)
-        return 1;
 
     struct server s;
     memset(&s, 0, sizeof s);
@@ -258,7 +251,6 @@ int main(int argc, char **argv)
     for (int i = 0; i < cfg->nroutes; i++)
         if (cfg->routes[i].cache && cfg->cache_size && !s.cache)
             s.cache = cache_new(cfg->cache_size);
-    s.forward_loopback = cfg->has_forward && net_is_loopback(&cfg->forward);
     struct stat lst;
     s.log_regular = s.log_fd >= 0 && fstat(s.log_fd, &lst) == 0 && S_ISREG(lst.st_mode);
     /* 다른 컴퓨터의 같은 프로그램과 구별되도록 시작할 때마다 다른 이름 */
@@ -269,7 +261,6 @@ int main(int argc, char **argv)
     if (rnd >= 0)
         close(rnd);
     snprintf(s.via, sizeof s.via, "jiho-webserver-%08x", id);
-    snprintf(s.via_forward, sizeof s.via_forward, "jiho-webserver-%08x-forward", id);
     s.nloops = cfg->loops ? cfg->loops : (int)sysconf(_SC_NPROCESSORS_ONLN);
     s.loops = calloc((size_t)s.nloops, sizeof *s.loops);
     for (int i = 0; i < s.nloops; i++)
@@ -294,7 +285,6 @@ int main(int argc, char **argv)
     run(&s, cfg, evfd, doors, ndoors, in.alive);
 
     health_stop();
-    resolver_stop(); /* 이 뒤로는 루프에 쪽지를 보내지 않는다 */
     for (int i = 0; i < s.nloops; i++)
         loop_join(&s.loops[i]);
     free(s.loops);
