@@ -1,5 +1,6 @@
 #include "health.h"
 #include "net.h"
+#include "resolver.h"
 #include "server.h"
 #include "str.h"
 
@@ -155,22 +156,21 @@ static void run(struct server *s, struct config *cfg, int evfd, struct door *doo
                     paused_until = now + 100;
             } else if (ev[i].io->kind == IO_HEALTH) {
                 health_event(ev[i].io, ev[i].ready, now);
-            } else {
-                char buf[16];
-                if (read(g_sig_pipe[0], buf, sizeof buf) <= 0)
-                    continue;
-                if (signals++ == 0) {
-                    fprintf(stderr, "종료 시작: 처리 중인 요청을 마칩니다\n");
-                    for (int k = 0; k < ndoors; k++) {
-                        accept_some(s, doors[k].io.fd, doors[k].origin); /* 이미 handshake가 끝난 연결까지 받고 */
-                        ev_set(evfd, &doors[k].io, 0);
-                        close(doors[k].io.fd); /* 문을 닫는다. 이제 새 연결은 커널이 거절한다 */
-                    }
-                    tell_loops(s, MSG_DRAIN);
-                    kill_at = now + cfg->drain_ms;
-                } else {
-                    kill_at = now; /* 두 번째 시그널: 기다리지 않는다 */
+            }
+        }
+        char sig[16];
+        if (read(g_sig_pipe[0], sig, sizeof sig) > 0) {
+            if (signals++ == 0) {
+                fprintf(stderr, "종료 시작: 처리 중인 요청을 마칩니다\n");
+                for (int k = 0; k < ndoors; k++) {
+                    accept_some(s, doors[k].io.fd, doors[k].origin); /* 이미 handshake가 끝난 연결까지 받고 */
+                    ev_set(evfd, &doors[k].io, 0);
+                    close(doors[k].io.fd); /* 문을 닫는다. 이제 새 연결은 커널이 거절한다 */
                 }
+                tell_loops(s, MSG_DRAIN);
+                kill_at = now + cfg->drain_ms;
+            } else {
+                kill_at = now; /* 두 번째 시그널: 기다리지 않는다 */
             }
         }
         for (int k = 0; signals == 0 && k < ndoors; k++)
@@ -207,7 +207,9 @@ int main(int argc, char **argv)
     struct door doors[3];
     int ndoors = 0;
     if (!open_door(&doors[ndoors++], &cfg->listen, ORIGIN_WEB) ||
-        (cfg->has_admin && !open_door(&doors[ndoors++], &cfg->admin, ORIGIN_ADMIN)))
+        (cfg->has_admin && !open_door(&doors[ndoors++], &cfg->admin, ORIGIN_ADMIN)) ||
+        (cfg->has_forward && !open_door(&doors[ndoors++], &cfg->forward, ORIGIN_FORWARD)) ||
+        (cfg->has_forward && resolver_start(2) < 0))
         return 1;
 
     struct server s;
@@ -236,6 +238,7 @@ int main(int argc, char **argv)
     run(&s, cfg, evfd, doors, ndoors);
 
     health_stop();
+    resolver_stop(); /* 이 뒤로는 루프에 쪽지를 보내지 않는다 */
     for (int i = 0; i < s.nloops; i++)
         loop_join(&s.loops[i]);
     free(s.loops);

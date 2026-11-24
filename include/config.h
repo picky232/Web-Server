@@ -27,6 +27,7 @@ struct config {
     int max_cgi;
     int min_rate; /* 이보다 느리게(초당 바이트) 보내거나 받는 연결은 끊는다 */
     int head_ms, idle_ms, connect_ms, response_ms, stall_ms, drain_ms, cgi_ms, health_ms;
+    int connect_ports[8], nconnect_ports; /* 포워드 프록시의 CONNECT가 허용하는 포트 */
     char access_log[512]; /* 빈 문자열 = 끔, "-" = 표준 오류 */
     struct pool pools[16];
     int npools, nbackends;

@@ -41,6 +41,7 @@ struct exchange {
     bool sent_100;
     const struct route *route;
     const struct handler *h;
+    bool started; /* h->start를 불렀다 → 끝날 때 h->stop도 불러야 한다 */
     struct reply reply;
     long long start_ms;
     char served_by[96]; /* 로그용: 누가 처리했나 */

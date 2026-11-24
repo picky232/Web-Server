@@ -27,5 +27,6 @@ void net_ip(const struct addr *a, char *out, size_t cap);
 int net_port(const struct addr *a);
 int net_local_port(int fd);
 bool net_is_loopback(const struct addr *a);
+bool net_is_private(const struct addr *a); /* 바깥에서 닿으면 안 되는 내부·특수 주소 */
 
 #endif

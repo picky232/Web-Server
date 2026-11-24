@@ -1,5 +1,6 @@
 #include "exchange.h"
 #include "conn.h"
+#include "forward.h"
 #include "loop.h"
 #include "route.h"
 #include "log.h"
@@ -17,7 +18,7 @@ static void stop_handler(struct conn *c)
     const struct handler *h = ex->h;
     ex->h = NULL;
     ex->deadline = 0;
-    if (h && h->stop)
+    if (h && ex->started && h->stop)
         h->stop(c);
 }
 
@@ -96,7 +97,72 @@ static const char *allowed(const struct route *r, enum http_method m)
 static void start_handler(struct conn *c)
 {
     conn_set_state(c, CS_RESPOND);
+    c->ex->started = true;
     c->ex->h->start(c);
+}
+
+static int copy_path(struct exchange *ex, bool normalize)
+{
+    struct sl p = ex->target.path;
+    ex->path = malloc(p.n + 8);
+    if (!ex->path)
+        return 500;
+    if (normalize)
+        return uri_normalize(p, ex->path, p.n + 8);
+    sl_copy(p, ex->path, p.n + 8); /* 포워드 프록시는 남의 서버 경로를 고치지 않는다 */
+    return 0;
+}
+
+static bool port_allowed(const struct config *cfg, int port)
+{
+    for (int i = 0; i < cfg->nconnect_ports; i++)
+        if (cfg->connect_ports[i] == port)
+            return true;
+    return false;
+}
+
+/* 포워드 프록시 포트로 온 요청 */
+static int decide_forward(struct conn *c)
+{
+    struct exchange *ex = c->ex;
+    const struct config *cfg = c->loop->srv->cfg;
+    bool connect = ex->req.method == M_CONNECT;
+    if (connect || ex->req.minor == 0) /* HTTP/1.0 클라이언트와는 연결을 유지하지 않는다 (RFC 9112 9.3) */
+        ex->reply.keep = false;
+    if (!connect && !ex->target.absolute)
+        return 400; /* 프록시에게는 목적지까지 적어서 보내야 한다 */
+    if (ex->req.expect_100) /* 본문을 먼저 다 받는 구조라 "머리 먼저 전달"을 지킬 수 없다 → 최종 응답으로 끝낸다 */
+        return 417;
+    if (connect && !port_allowed(cfg, ex->port))
+        return 403;
+    int status = connect ? 0 : copy_path(ex, false);
+    ex->h = connect ? &tunnel_handler : &forward_handler;
+    return status;
+}
+
+/* 관리 포트와 일반 포트로 온 요청 */
+static int decide_local(struct conn *c, const char **allow)
+{
+    struct exchange *ex = c->ex;
+    enum http_method m = ex->req.method;
+    if (m == M_CONNECT) {
+        ex->reply.keep = false; /* 터널이라고 믿은 바이트가 다음 요청으로 읽히면 안 된다 */
+        return 501;
+    }
+    int status = copy_path(ex, true);
+    if (status)
+        return status;
+    if (c->origin == ORIGIN_ADMIN) {
+        ex->h = &status_handler;
+        *allow = m == M_GET || m == M_HEAD ? NULL : "Allow: GET, HEAD\r\n";
+        return *allow ? 405 : 0;
+    }
+    ex->route = route_find(c->loop->srv->cfg, ex->host, ex->path);
+    if (!ex->route)
+        return 404;
+    ex->h = handler_for(ex->route);
+    *allow = allowed(ex->route, m);
+    return *allow ? 405 : 0;
 }
 
 /* 머리를 다 받은 요청을 어떻게 할지 정한다. 여기에는 I/O가 없다 */
@@ -105,55 +171,35 @@ static void decide(struct conn *c, int status)
     struct exchange *ex = c->ex;
     struct http_req *r = &ex->req;
     const struct config *cfg = c->loop->srv->cfg;
+    const char *allow = NULL;
     ex->reply.minor = r->minor;
     ex->reply.head_only = r->method == M_HEAD && status == 0;
     ex->reply.keep = status == 0 && r->keep && !c->loop->draining;
-    if (status == 0)
+    if (status == 0) {
         body_init(&ex->dec, r->chunked ? BODY_CHUNKED : r->length > 0 ? BODY_LENGTH : BODY_NONE, r->length);
-    if (status == 0)
         status = uri_split(r->target, r->method, &ex->target);
-    if (status == 0 && r->method == M_CONNECT) {
-        ex->reply.keep = false; /* 터널이라고 믿은 바이트가 다음 요청으로 읽히면 안 된다 */
-        status = 501;
     }
-    if (status == 0 && (ex->target.absolute || r->host.p)) /* 절대형이면 Host 헤더는 무시한다 */
-        status = uri_host(ex->target.absolute ? ex->target.authority : r->host, 80, ex->host,
-                          sizeof ex->host, &ex->port);
+    /* 호스트는 요청 줄에 적힌 것(절대형, CONNECT)이 먼저, 없으면 Host 헤더 */
+    struct sl authority = ex->target.authority.n ? ex->target.authority : r->host;
+    if (status == 0 && authority.p)
+        status = uri_host(authority, 80, ex->host, sizeof ex->host, &ex->port);
     if (status == 0 && ex->target.asterisk) {
         exchange_error(c, 204, "Allow: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS\r\n");
         return;
     }
-    if (status == 0) {
-        size_t cap = ex->target.path.n + 2;
-        ex->path = malloc(cap + 4);
-        status = ex->path ? uri_normalize(ex->target.path, ex->path, cap + 4) : 500;
-    }
+    if (status == 0)
+        status = c->origin == ORIGIN_FORWARD ? decide_forward(c) : decide_local(c, &allow);
     if (status == 0 && r->expect_other)
         status = 417;
-    const char *allow = NULL;
-    if (status == 0 && c->origin == ORIGIN_ADMIN) {
-        if (r->method != M_GET && r->method != M_HEAD) {
-            status = 405;
-            allow = "Allow: GET, HEAD\r\n";
-        }
-    } else if (status == 0) {
-        ex->route = route_find(cfg, ex->host, ex->path);
-        if (!ex->route)
-            status = 404;
-        else if ((allow = allowed(ex->route, r->method)))
-            status = 405;
-    }
     if (status == 0 && r->length > cfg->max_body)
         status = 413; /* 길이를 미리 알면 본문을 받기 전에 거절한다 */
     if (status) {
         exchange_error(c, status, allow);
-        return;
-    }
-    ex->h = c->origin == ORIGIN_ADMIN ? &status_handler : handler_for(ex->route);
-    if (ex->dec.done)
+    } else if (ex->dec.done) {
         start_handler(c);
-    else
+    } else {
         conn_set_state(c, CS_BODY);
+    }
 }
 
 static struct exchange *new_exchange(struct conn *c)
