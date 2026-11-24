@@ -473,7 +473,7 @@ class ProxyRelay(ProxyCase):
                          b"HEAD /head HTTP/1.1\r\n" + H + b"\r\n" + b"GET /z HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
         self.assertEqual((statuses(out), end), ([204, 304, 200, 200], "EOF"))
         self.assertIn(b"Content-Length: 1000", out)
-        self.assertEqual(self.b[0].connections, 1)  # 백엔드 연결 하나를 계속 다시 썼다
+        self.assertEqual(self.b[0].connections, 2)  # HEAD 뒤에만 새 연결, 나머지는 다시 썼다
 
     def test_interim_responses(self):
         # 예전 구현의 결함: 103을 최종 응답으로 보고 진짜 200을 버렸다
@@ -487,6 +487,8 @@ class ProxyRelay(ProxyCase):
     def test_bad_responses_become_502(self):
         bad = [b"garbage\r\n\r\n", b"HTTP/1.1 200 OK\nContent-Length: 0\n\n", b"HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n",
                b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n", b"HTTP/1.1 101 Switching\r\n\r\n",
+               b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+               b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
                b"HTTP/1.1 200 OK\r\nX: " + b"a" * 30000 + b"\r\n\r\n", b"HTTP/1.1 200"]
         for data in bad:
             b = Backend(send(data, close=True))
@@ -523,6 +525,30 @@ class ProxyRelay(ProxyCase):
         s = self.up(script)
         st, _, body, _ = s.get("/", method="POST", body=b"x" * 5_000_000)
         self.assertEqual((st, body), (413, b"big"))
+
+    def test_reset_while_reading_until_close_is_not_a_complete_answer(self):
+        def script(sock, head, body):
+            sock.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial")
+            time.sleep(0.2)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\1\0\0\0\0\0\0\0")
+            return False
+        s = self.up(script)
+        out, end = s.raw(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+        self.assertNotIn(b"\r\n0\r\n\r\n", out)
+        self.assertNotEqual(end, "OPEN")
+        self.assertEqual(s.raw(b"GET / HTTP/1.0\r\n\r\n")[1], "RST")
+
+    def test_late_body_of_head_does_not_reach_anyone(self):
+        def script(sock, head, body):
+            if head.startswith(b"HEAD"):
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                time.sleep(0.02)
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nFAKE")
+            else:
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal")
+        s = self.up(script, extra="loops 1\n")
+        out, _ = s.raw(b"HEAD /h HTTP/1.1\r\n" + H + b"\r\n" + (b"GET /a HTTP/1.1\r\n" + H + b"\r\n") * 3 + b"GET /z HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        self.assertEqual((out.count(b"real"), out.count(b"FAKE")), (4, 0))
 
     def test_leftover_bytes_do_not_reach_the_next_client(self):
         n = [0]
@@ -630,6 +656,32 @@ class ProxyFailure(ProxyCase):
         s = self.up(script)
         self.assertEqual([s.get("/hang")[0] for _ in range(6)], [504] * 6)
         self.assertEqual(s.get("/")[0], 200)
+
+    def test_header_drip_from_backend_is_504(self):
+        def script(sock, head, body):
+            for ch in b"HTTP/1.1 200 OK\r\nX: " + b"a" * 100:
+                sock.sendall(bytes([ch]))
+                time.sleep(0.1)
+        s = self.up(script)
+        t = time.time()
+        self.assertEqual(s.get("/")[0], 504)
+        self.assertLess(time.time() - t, 2)
+
+    def test_posts_survive_a_backend_that_closes_silently(self):
+        def script(sock, head, body):
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            return False
+        s = self.up(script, extra="loops 1\n")
+        bad = []
+
+        def one():
+            for _ in range(30):
+                if s.get("/", method="POST", body=b"x")[0] != 200:
+                    bad.append(1)
+        ts = [threading.Thread(target=one) for _ in range(8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(bad, [])
 
     def test_stall_in_body_cuts(self):
         s = self.up(send(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc", b"", delay=2))
@@ -751,11 +803,17 @@ class Forward(ProxyCase):
                           (b"GET http://127.0.0.1:%d/ HTTP/1.1\r\n" % free_port() + H + b"\r\n", 502),
                           (b"CONNECT 127.0.0.1:22 HTTP/1.1\r\n" + H + b"\r\n", 403),
                           (b"POST http://127.0.0.1:%d/ HTTP/1.1\r\n" % self.b[0].port + H + b"Expect: 100-continue\r\nContent-Length: 1\r\n\r\n", 417),
-                          (b"GET http://127.0.0.1:%d/ HTTP/1.1\r\n" % self.fport + H + b"Via: 1.1 jiho-webserver-%d\r\n\r\n" % s.port, 508)]:
+                          (b"CONNECT 127.0.0.1 HTTP/1.1\r\n" + H + b"\r\n", 400),
+                          (b"GET http://127.0.0.1:%d/ HTTP/1.1\r\n" % self.fport + H + b"\r\n", 400)]:
             self.assertEqual(statuses(self.via(req, timeout=6)[0]), [want], req)
         # 일반 포트는 열린 프록시가 아니다: 절대형 주소가 와도 내 규칙대로만 처리
         out, _ = s.raw(b"GET http://127.0.0.1:%d/ HTTP/1.1\r\n" % self.b[0].port + H + b"Connection: close\r\n\r\n")
         self.assertEqual((statuses(out), self.b[0].requests), ([200], []))
+        self.assertEqual(statuses(self.via(b"OPTIONS http://127.0.0.1:%d HTTP/1.1\r\n" % self.b[0].port + H + b"Connection: close\r\n\r\n")[0]), [200])
+        self.assertTrue(self.b[0].requests[-1][0].startswith(b"OPTIONS * HTTP/1.1"))
+        n = len(self.b[0].requests)
+        self.assertEqual(statuses(self.via(b"OPTIONS http://127.0.0.1:%d/ HTTP/1.1\r\n" % self.b[0].port + H + b"Max-Forwards: 0\r\nConnection: close\r\n\r\n")[0]), [204])
+        self.assertEqual(len(self.b[0].requests), n)
         # HTTP/1.0 클라이언트와는 연결을 유지하지 않는다
         self.assertEqual(self.via(b"GET http://127.0.0.1:%d/ HTTP/1.0\r\nConnection: keep-alive\r\n\r\n" % self.b[0].port)[1], "EOF")
 
@@ -794,6 +852,13 @@ class Forward(ProxyCase):
         self.assertEqual(last, b"BYE")
         c.close()
         ls.close()
+
+    def test_forward_to_our_own_reverse_proxy_is_not_a_loop(self):
+        b = Backend(ok(b"deep"))
+        self.start(ok(), f"pool q 127.0.0.1:{b.port}\nroute * /q proxy q\n")
+        out, _ = self.via(b"GET http://127.0.0.1:%d/q HTTP/1.1\r\n" % self.s.port + H + b"Connection: close\r\n\r\n")
+        self.assertTrue(statuses(out) == [200] and out.endswith(b"deep"), out)
+        b.stop()
 
     def test_leaving_while_resolving(self):
         s = self.start(ok())
@@ -883,6 +948,31 @@ class Cache(ProxyCase):
         [t.join() for t in ts]
         self.assertEqual(bad, [])
 
+    def test_get_with_a_body_cannot_poison(self):
+        s = self.up(lambda sock, h, b: sock.sendall(b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: %d\r\n\r\n" % len(b) + b), route="route * / proxy p cache\n")
+        s.get("/p", body=b"evil")
+        self.assertEqual(s.get("/p")[2], b"")
+
+    def test_old_answer_is_not_stored_after_a_change(self):
+        state = {"v": b"v1"}
+
+        def script(sock, head, body):
+            if head.startswith(b"POST"):
+                state["v"] = b"v2"
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                return
+            v = state["v"]
+            if b"X-Slow" in head:
+                time.sleep(0.5)
+            sock.sendall(b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 2\r\n\r\n" + v)
+        s = self.up(script, route="route * / proxy p cache\n")
+        t = threading.Thread(target=lambda: s.get("/a", headers=[("X-Slow", "1")]))
+        t.start()
+        time.sleep(0.2)
+        s.get("/a", method="POST", body=b"x")
+        t.join()
+        self.assertEqual(s.get("/a")[2], b"v2")
+
     def test_survives_dead_backend(self):
         s = self.start()
         s.get("/a")
@@ -915,12 +1005,16 @@ class Cgi(Case):
         script(".hidden", sh)
         script("fds", "#!/usr/bin/env python3\nimport os\nprint('Content-Type: text/plain\\n')\nfor i in range(3, 300):\n    try:\n        os.fstat(i); print('open', i)\n    except OSError: pass\n")
         script("head_first", "#!/usr/bin/env python3\nimport sys\nsys.stdout.write('Content-Type: text/plain\\n\\n'); sys.stdout.flush()\nprint(len(sys.stdin.buffer.read()))\n")
+        script("early_exit", sh + "printf 'Content-Type: text/plain\\n\\nSTART\\n'; (sleep 0.6; echo END) & exit 0\n")
+        script("large", "#!/usr/bin/env python3\nprint('Content-Type: text/plain\\n'); print('x' * 120000, end='')\n")
+        script("endless", sh + "printf 'Content-Type: text/plain\\n\\n'; while true; do echo tick; sleep 0.2; done\n")
+        script("over", sh + "printf 'Content-Length: 2\\n\\n'; yes\n")
         script("slow_ok", sh + "sleep 0.7; printf 'Content-Type: text/plain\\n\\nok'\n")
         os.symlink("env", Path(d, "link"))
 
     @classmethod
     def make_conf(cls):
-        return f"route * /cgi/ cgi {cls.www}\ntimeout_cgi 1500ms\nmax_cgi 4\n"
+        return f"route * /cgi/ cgi {cls.www}\ntimeout_cgi 3s\nmax_cgi 4\n"
 
     def test_environment(self):
         st, _, body, _ = self.s.get("/cgi/env/a%20b/c?x=1&y=2", headers=[("X-One", "1"), ("Proxy", "http://evil"), ("Authorization", "secret"), ("A_B", "z")])
@@ -960,7 +1054,7 @@ class Cgi(Case):
     def test_timeout_kills_the_whole_family(self):
         t = time.time()
         self.assertEqual(self.s.get("/cgi/sleep", timeout=8)[0], 504)
-        self.assertLess(time.time() - t, 3)
+        self.assertLess(time.time() - t, 5)
         time.sleep(0.8)
         self.assertEqual(subprocess.run(["pgrep", "-P", str(self.s.p.pid)], capture_output=True).stdout, b"")
 
@@ -989,6 +1083,32 @@ class Cgi(Case):
         self.assertEqual(self.s.get("/cgi/fds")[2], b"")
         for c in cs:
             c.close()
+
+    def test_child_that_exits_before_its_output_ends(self):
+        self.assertEqual(self.s.get("/cgi/early_exit")[2], b"START\nEND\n")
+        c = socket.socket()  # 프로그램은 끝났는데 손님이 천천히 받는 경우
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        c.connect(("127.0.0.1", self.s.port))
+        c.sendall(b"GET /cgi/large HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        time.sleep(0.8)
+        out = b""
+        c.settimeout(5)
+        while d := c.recv(1 << 16):
+            out += d
+        c.close()
+        self.assertEqual(parse(out)[2], b"x" * 120_000)
+
+    def test_endless_output_does_not_hold_the_slot(self):
+        for req in (b"HEAD /cgi/endless", b"GET /cgi/over"):
+            for _ in range(4):
+                c = socket.create_connection(("127.0.0.1", self.s.port))
+                c.sendall(req + b" HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+                c.recv(1000)
+                c.close()
+            end = time.time() + 4
+            while self.s.get("/cgi/status")[0] != 418 and time.time() < end:
+                time.sleep(0.1)
+            self.assertLess(time.time(), end, req)
 
     def test_head(self):
         st, _, body, _ = self.s.get("/cgi/status", method="HEAD")
@@ -1029,26 +1149,33 @@ class Observe(Case):
 
     def test_blocked_log_does_not_block_the_server(self):
         r, w = os.pipe()
-        with tempfile.TemporaryDirectory() as d:
-            port = free_port()
-            p = subprocess.Popen([BIN, "-p", str(port), "-r", self.www], stderr=w)
-            os.close(w)
-            try:
-                time.sleep(0.5)
-                one = b"GET /index.html HTTP/1.1\r\n" + H + b"\r\n"
-                c = socket.create_connection(("127.0.0.1", port))
-                c.settimeout(10)
-                n = 0
-                for _ in range(60):  # 로그를 읽지 않는 파이프가 꽉 차도 응답은 계속 나와야 한다
-                    c.sendall(one * 50)
-                    while n < 50:
-                        n += c.recv(1 << 20).count(b"200 OK")
-                    n = 0
-                c.close()
-            finally:
-                os.close(r)
-                p.terminate()
-                p.wait(5)
+        port = free_port()
+        p = subprocess.Popen([BIN, "-p", str(port), "-r", self.www, "-t", "1"], stderr=w)
+        os.close(w)
+        one = b"GET /index.html HTTP/1.1\r\n" + H + b"\r\n"
+
+        def burst(c, n):
+            c.sendall(one * n)
+            got = 0
+            while got < n:
+                got += c.recv(1 << 20).count(b"200 OK")
+        try:
+            time.sleep(0.5)
+            c = socket.create_connection(("127.0.0.1", port))
+            c.settimeout(5)
+            for _ in range(60):  # 로그를 읽지 않는 파이프가 꽉 차도 응답은 계속 나와야 한다
+                burst(c, 50)
+            os.read(r, 4096)  # 조금만 읽고 다시 멈춰도 마찬가지 (한 번에 크게 쓰면 여기서 잠든다)
+            for _ in range(10):
+                burst(c, 50)
+            c.close()
+            p.terminate()
+            self.assertEqual(p.wait(5), 0)
+        finally:
+            os.close(r)
+            if p.poll() is None:
+                p.kill()
+                p.wait()
 
 
 # ---- 과부하, 제한 시간, 종료 ----
@@ -1118,6 +1245,58 @@ class Limits(unittest.TestCase):
         self.assertIn(b"408", c.recv(100))
         self.assertEqual(b.requests, [])  # 느린 업로드는 백엔드에 닿지도 않는다
         b.stop()
+
+    def test_upload_that_stops_gives_the_disk_back(self):
+        import json
+        b = Backend(ok())
+        s = self.serve(f"timeout_head 600ms\nmax_upload_disk 4m\npool p 127.0.0.1:{b.port}\nroute * /up proxy p\n")
+        c = self.connect(b"POST /up HTTP/1.1\r\n" + H + b"Content-Length: 4194304\r\n\r\n" + b"x" * 3_900_000)
+        time.sleep(0.2)
+        self.assertEqual(s.get("/up", method="POST", body=b"y" * 400_000)[0], 503)
+        time.sleep(1.5)  # 빨리 보내 벌어 둔 시간은 멈춘 순간 소용이 없어야 한다
+        self.assertEqual(s.get("/up", method="POST", body=b"y" * 400_000)[0], 200)
+        c.close()
+        b.stop()
+
+    def test_moving_upload_is_not_evicted(self):
+        b = Backend(ok())
+        s = self.serve(f"max_connections 2\nloops 1\npool p 127.0.0.1:{b.port}\nroute * /up proxy p\n")
+        res = []
+
+        def upload():
+            c = socket.create_connection(("127.0.0.1", s.port))
+            c.settimeout(10)
+            try:
+                c.sendall(b"POST /up HTTP/1.1\r\n" + H + b"Content-Length: 2000000\r\nConnection: close\r\n\r\n")
+                for _ in range(20):
+                    c.sendall(b"z" * 100_000)
+                    time.sleep(0.05)
+                res.append(c.recv(12))
+            except OSError as e:
+                res.append(e)
+        ts = [threading.Thread(target=upload) for _ in range(2)]
+        [t.start() for t in ts]
+        time.sleep(0.4)
+        self.assertEqual(s.get("/")[0], 503)
+        [t.join() for t in ts]
+        self.assertEqual(res, [b"HTTP/1.1 200"] * 2)
+        b.stop()
+
+    def test_requests_already_in_the_queue_survive_sigterm(self):
+        s = self.serve()
+        s.p.send_signal(signal.SIGSTOP)
+        cs = [self.connect(b"GET / HTTP/1.1\r\n" + H + b"\r\n") for _ in range(100)]
+        s.p.send_signal(signal.SIGTERM)
+        s.p.send_signal(signal.SIGCONT)
+        ok_ = 0
+        for c in cs:
+            try:
+                ok_ += c.recv(1000).startswith(b"HTTP/1.1 200")
+            except OSError:
+                pass
+            c.close()
+        self.assertEqual(ok_, 100)
+        s.stop()
 
     def test_reader_that_stops_is_cut(self):
         self.serve("timeout_stall 700ms\n")
@@ -1272,6 +1451,12 @@ class Supervisor(unittest.TestCase):
     def workers(self):
         return [int(x) for x in subprocess.run(["pgrep", "-P", str(self.p.pid)], capture_output=True).stdout.split()]
 
+    def hup(self, which):
+        n = Path(self.d, "err").read_text().count("준비됨")
+        self.write(which)
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: Path(self.d, "err").read_text().count("준비됨") > n)
+
     def test_reload_without_losing_a_request(self):
         big = socket.socket()
         big.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
@@ -1285,12 +1470,10 @@ class Supervisor(unittest.TestCase):
             while not stop.is_set():
                 if self.get() not in ("a", "b"):
                     lost.append(1)
-        ts = [threading.Thread(target=hammer) for _ in range(4)]
+        ts = [threading.Thread(target=hammer) for _ in range(12)]
         [t.start() for t in ts]
-        self.write("b")
-        self.p.send_signal(signal.SIGHUP)
-        self.wait(lambda: self.get() == "b")
-        time.sleep(0.5)
+        for i in range(6):
+            self.hup("ba"[i % 2])
         stop.set()
         [t.join() for t in ts]
         self.assertEqual(lost, [])
@@ -1300,6 +1483,55 @@ class Supervisor(unittest.TestCase):
         self.assertEqual(set(got[-1000:]), set(b"a"))
         big.close()
         self.wait(lambda: len(self.workers()) == 1)
+
+    def test_stop_after_reload_still_finishes_old_downloads(self):
+        big = socket.socket()
+        big.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+        big.connect(("127.0.0.1", self.port))
+        big.settimeout(10)
+        big.sendall(b"GET /big HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        got = len(big.recv(1000))
+        self.hup("b")
+        self.p.terminate()  # 옛 워커에게는 이미 한 번 갔으므로, 또 보내 "당장 끝내라"로 만들면 안 된다
+        time.sleep(0.5)
+        while d := big.recv(1 << 20):
+            got += len(d)
+        self.assertGreater(got, 20 << 20)
+        big.close()
+        self.assertEqual(self.p.wait(10), 0)
+
+    def test_address_change_is_refused_by_reload(self):
+        self.conf.write_text(f"listen 0.0.0.0:{self.port}\nloops 2\naccess_log off\nroute * / static {self.d}/b\n")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: "시작하지 못했습니다" in Path(self.d, "err").read_text())
+        self.assertEqual(self.get(), "a")
+
+    def test_supervisor_does_not_give_up(self):
+        exe = Path(self.d, "srv")
+        shutil.copy(BIN, exe)
+        self.p.terminate()
+        self.p.wait(10)
+        self.p = subprocess.Popen([str(exe), "-s", "-c", str(self.conf)], stderr=self.err)
+        self.wait(lambda: self.get() == "a")
+        w = self.workers()[0]
+        exe.rename(str(exe) + "x")  # 실행 파일을 교체하는 순간 워커가 죽었다
+        os.kill(w, signal.SIGKILL)
+        time.sleep(0.6)
+        Path(str(exe) + "x").rename(exe)
+        self.wait(lambda: self.get() == "a")
+
+    def test_supervisor_survives_a_lost_log_reader(self):
+        self.p.terminate()
+        self.p.wait(10)
+        r, w = os.pipe()
+        self.p = subprocess.Popen([BIN, "-s", "-c", str(self.conf)], stderr=w)
+        os.close(w)
+        self.wait(lambda: self.get() == "a")
+        os.close(r)
+        self.write("b")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: self.get() == "b")
+        self.assertIsNone(self.p.poll())
 
     def test_bad_config_keeps_the_old_one(self):
         self.write("b", "nonsense here\n")

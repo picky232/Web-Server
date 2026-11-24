@@ -1,10 +1,11 @@
 /* 리버스 프록시: 요청을 다시 써서 백엔드에 보내고, 응답을 해석해 클라이언트에게 다시 포장한다 */
 #include "upstream.h"
+#include "caching.h"
 #include "config.h"
 #include "conn.h"
+#include "log.h"
 #include "loop.h"
 #include "server.h"
-#include "static.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -12,94 +13,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#define UP_IN_MAX 65536
-#define UP_OUT_MAX 65536
 #define SEND_CHUNK 16384
-#define IDLE_MAX 16          /* 루프·백엔드마다 보관하는 연결 수 */
-#define IDLE_MS 4000         /* 백엔드가 먼저 닫기 전에 버린다 */
-#define IDLE_UNSAFE_MS 1000  /* POST 같은 요청은 방금 쓴 연결만 다시 쓴다 */
 #define INTERIM_MAX 8
-
-/* ---- 쉬는 연결 보관함 ---- */
-
-static void idle_remove(struct upconn *up)
-{
-    struct idle_list *l = &up->loop->idle[up->be->index];
-    if (up->prev)
-        up->prev->next = up->next;
-    else
-        l->head = up->next;
-    if (up->next)
-        up->next->prev = up->prev;
-    up->prev = up->next = NULL;
-    l->n--;
-}
-
-static void idle_put(struct upconn *up)
-{
-    struct idle_list *l = &up->loop->idle[up->be->index];
-    if (l->n >= IDLE_MAX) {
-        loop_bury(up->loop, &up->io);
-        return;
-    }
-    up->c = NULL;
-    up->reused = true;
-    up->idle_since = up->loop->now;
-    up->io.ready = 0;
-    buf_free(&up->in);
-    buf_free(&up->out);
-    up->next = l->head;
-    if (l->head)
-        l->head->prev = up;
-    l->head = up;
-    l->n++;
-    loop_watch(up->loop, &up->io, IO_R); /* 쉬는 동안 백엔드가 닫으면 바로 알아채려고 */
-}
-
-static struct upconn *idle_take(struct loop *l, struct backend *b, bool safe)
-{
-    struct upconn *up = l->idle[b->index].head; /* 가장 최근에 쓴 것 */
-    if (!up || l->now - up->idle_since > (safe ? IDLE_MS : IDLE_UNSAFE_MS))
-        return NULL;
-    idle_remove(up);
-    return up;
-}
-
-void upstream_scan(struct loop *l)
-{
-    for (int i = 0; i < l->srv->cfg->nbackends; i++)
-        for (struct upconn *up = l->idle[i].head, *next; up; up = next) {
-            next = up->next;
-            if (l->draining || l->now - up->idle_since > IDLE_MS) {
-                idle_remove(up);
-                loop_bury(l, &up->io);
-            }
-        }
-}
-
-void upstream_close_all(struct loop *l)
-{
-    l->draining = true;
-    upstream_scan(l);
-}
-
-void upconn_free(struct upconn *up)
-{
-    buf_free(&up->in);
-    buf_free(&up->out);
-    free(up);
-}
-
-void upstream_event(struct upconn *up)
-{
-    if (up->c) {
-        conn_run(up->c);
-        return;
-    }
-    /* 쉬는 연결에 온 것은 "닫힘"이거나 요청하지도 않은 바이트다. 둘 다 다시 쓰면 안 된다 */
-    idle_remove(up);
-    loop_bury(up->loop, &up->io);
-}
 
 /* ---- 요청 머리 다시 쓰기 ---- */
 
@@ -128,7 +43,12 @@ bool upstream_request_head(const struct exchange *ex, const char *ip, const char
         size_t nrewritten = ip ? sizeof rewritten / sizeof rewritten[0] : 3;
         for (size_t k = 0; !skip && k < nrewritten; k++)
             skip = sl_eqi(f->name, rewritten[k]);
-        if (!skip)
+        /* X_Forwarded_For는 백엔드에서 X-Forwarded-For와 같은 환경 변수가 되어 위조에 쓰인다 */
+        skip = skip || (ip && memchr(f->name.p, '_', f->name.n));
+        long long hops;
+        if (!skip && r->method == M_OPTIONS && sl_eqi(f->name, "Max-Forwards") && sl_to_ll(f->value, &hops))
+            ok = buf_printf(out, "Max-Forwards: %lld\r\n", hops - 1);
+        else if (!skip)
             ok = put(out, f->name, f->value);
     }
     ok = ok && buf_printf(out, "Via: 1.1 %s\r\n", via);
@@ -141,146 +61,18 @@ bool upstream_request_head(const struct exchange *ex, const char *ip, const char
     return ok && buf_append(out, "\r\n", 2);
 }
 
-/* ---- 캐시 ---- */
-
-#define CACHE_OBJECT_MAX (1 << 20)
+/* ---- 백엔드 고르기와 연결 ---- */
 
 static struct proxy_st *px_of(struct conn *c)
 {
     return &c->ex->u.proxy;
 }
 
-static bool cache_on(const struct conn *c)
+/* 두 문은 이름이 다르다. 포워드로 들어온 요청이 우리 리버스 프록시를 거치는 것은 순환이 아니다 */
+static const char *via_name(const struct conn *c)
 {
-    return c->ex->route && c->ex->route->cache && c->loop->srv->cache;
+    return c->origin == ORIGIN_FORWARD ? c->loop->srv->via_forward : c->loop->srv->via;
 }
-
-/* "호스트 경로?쿼리". 같은 주소라도 호스트가 다르면 다른 응답이다 */
-static char *cache_key(const struct exchange *ex)
-{
-    size_t n = strlen(ex->host) + strlen(ex->path) + ex->target.query.n + 32;
-    char *k = malloc(n);
-    if (k)
-        snprintf(k, n, "%s:%d %s%.*s", ex->host, ex->port, ex->path, (int)ex->target.query.n,
-                 ex->target.query.n ? ex->target.query.p : "");
-    return k;
-}
-
-static void saving_drop(struct proxy_st *px)
-{
-    if (!px->saving)
-        return;
-    atomic_store(&px->saving->refs, 1);
-    cached_unref(px->saving);
-    px->saving = NULL;
-}
-
-/* 이 응답을 저장해도 되면 사본을 만들기 시작한다 */
-static void saving_begin(struct conn *c, const struct http_res *res, const struct buf *extra, unsigned flags)
-{
-    struct proxy_st *px = px_of(c);
-    long long age = 0, fresh = cache_on(c) ? cache_fresh_ms(&c->ex->req, res, &age) : 0;
-    if (!fresh || res->length > CACHE_OBJECT_MAX)
-        return;
-    struct cached *o = calloc(1, sizeof *o);
-    if (!o)
-        return;
-    px->saving = o;
-    px->saving_cap = 0;
-    o->key = cache_key(c->ex);
-    o->head = malloc(buf_len(extra) + 1);
-    if (!o->key || !o->head) {
-        saving_drop(px);
-        return;
-    }
-    /* Age는 꺼낼 때 새로 계산해서 붙이므로 저장하지 않는다 */
-    for (const char *p = buf_head(extra), *end = p + buf_len(extra); p < end;) {
-        const char *eol = (const char *)memchr(p, '\n', (size_t)(end - p)) + 1;
-        const char *colon = memchr(p, ':', (size_t)(eol - p));
-        struct sl name = {p, (size_t)(colon - p)};
-        if (!sl_eqi(name, "Age")) {
-            memcpy(o->head + o->head_n, p, (size_t)(eol - p));
-            o->head_n += (size_t)(eol - p);
-        }
-        p = eol;
-    }
-    const struct field *etag = fields_find(&res->h, "ETag");
-    if (etag)
-        sl_copy(etag->value, o->etag, sizeof o->etag);
-    o->flags = flags;
-    o->stored_ms = c->loop->now;
-    o->age_ms = age;
-    o->fresh_ms = fresh;
-}
-
-static void saving_add(struct proxy_st *px, struct sl data)
-{
-    struct cached *o = px->saving;
-    if (!o)
-        return;
-    if (o->body_n + data.n > CACHE_OBJECT_MAX) {
-        saving_drop(px);
-        return;
-    }
-    if (o->body_n + data.n > px->saving_cap) {
-        size_t cap = (o->body_n + data.n) * 2;
-        char *p = realloc(o->body, cap);
-        if (!p) {
-            saving_drop(px);
-            return;
-        }
-        o->body = p;
-        px->saving_cap = cap;
-    }
-    memcpy(o->body + o->body_n, data.p, data.n);
-    o->body_n += data.n;
-}
-
-static void cache_start(struct conn *c, struct cached *o)
-{
-    struct exchange *ex = c->ex;
-    ex->u.cache = (struct cache_st){.o = o};
-    ex->h = &cache_handler;
-    ex->deadline = 0;
-    snprintf(ex->served_by, sizeof ex->served_by, "cache");
-    const struct field *inm = fields_find(&ex->req.h, "If-None-Match");
-    bool same = inm && o->etag[0] && etag_matches(inm->value, o->etag);
-    struct buf extra;
-    buf_init(&extra, HTTP_HEAD_MAX * 2);
-    bool ok = buf_append(&extra, o->head, o->head_n) &&
-              buf_printf(&extra, "Age: %lld\r\nX-Cache: HIT\r\n", (c->loop->now - o->stored_ms + o->age_ms) / 1000) &&
-              reply_start(&ex->reply, &c->out, same ? 304 : 200, (long long)o->body_n, buf_head(&extra), buf_len(&extra),
-                          o->flags);
-    buf_free(&extra);
-    if (!ok)
-        exchange_abort(c);
-}
-
-static bool cache_pump(struct conn *c)
-{
-    struct cache_st *s = &c->ex->u.cache;
-    size_t n = reply_room(&c->ex->reply, &c->out), left = s->o->body_n - s->off;
-    if (c->ex->reply.framing == FRAME_NONE)
-        left = 0;
-    if (left == 0) {
-        exchange_finish(c);
-        return true;
-    }
-    if (n > left)
-        n = left;
-    reply_write(&c->ex->reply, &c->out, s->o->body + s->off, n);
-    s->off += n;
-    return n > 0;
-}
-
-static void cache_stop(struct conn *c)
-{
-    cached_unref(c->ex->u.cache.o);
-}
-
-const struct handler cache_handler = {.name = "cache", .pump = cache_pump, .stop = cache_stop};
-
-/* ---- 백엔드 고르기와 연결 ---- */
 
 /* 요청을 다시 보내도 두 번 처리될 위험이 없는가 */
 static bool retry_safe(const struct exchange *ex)
@@ -294,7 +86,7 @@ static void release(struct conn *c, enum outcome o, bool reuse)
     struct proxy_st *px = px_of(c);
     if (px->up) {
         if (reuse)
-            idle_put(px->up);
+            upconn_keep(px->up);
         else
             loop_bury(c->loop, &px->up->io);
         px->up = NULL;
@@ -302,7 +94,7 @@ static void release(struct conn *c, enum outcome o, bool reuse)
     if (px->be) {
         const char *why = pool_done(px->pool, px->be, o, c->loop->now);
         if (why)
-            fprintf(stderr, "백엔드 제외: %s %s (%s)\n", px->pool->name, px->be->name, why);
+            log_note("백엔드 제외: %s %s (%s)", px->pool->name, px->be->name, why);
         px->be = NULL;
     }
 }
@@ -313,25 +105,12 @@ static void fail(struct conn *c, int status, enum outcome o)
     exchange_error(c, status, status == 503 ? "Retry-After: 1\r\n" : NULL);
 }
 
-static bool open_upconn(struct conn *c, const struct addr *a, struct backend *b)
+static bool open_up(struct conn *c, const struct addr *a, struct backend *b)
 {
-    int fd = net_connect(a);
-    struct upconn *up = fd >= 0 ? calloc(1, sizeof *up) : NULL;
-    if (!up) {
-        int e = fd < 0 ? errno : ENOMEM;
-        if (fd >= 0)
-            close(fd);
-        errno = e;
-        return false;
-    }
-    up->io = (struct io){.fd = fd, .kind = IO_UPSTREAM};
-    up->loop = c->loop;
-    up->be = b;
-    buf_init(&up->in, UP_IN_MAX);
-    buf_init(&up->out, UP_OUT_MAX);
-    px_of(c)->up = up;
-    px_of(c)->connecting = true;
-    return true;
+    struct proxy_st *px = px_of(c);
+    px->up = upconn_open(c->loop, a, b);
+    px->connecting = px->up != NULL;
+    return px->up != NULL;
 }
 
 /* 연결이 생겼다(또는 시작했다). 요청 머리를 준비한다 */
@@ -347,7 +126,7 @@ static void prepare(struct conn *c, const char *ip, const char *default_host)
     px->touched = c->loop->now;
     ex->deadline = c->loop->now + (px->connecting ? cfg->connect_ms : cfg->response_ms);
     if (ex->req.method != M_CONNECT &&
-        !upstream_request_head(ex, ip, c->loop->srv->via, default_host, &px->up->out))
+        !upstream_request_head(ex, ip, via_name(c), default_host, &px->up->out))
         fail(c, 431, OUT_NEUTRAL);
 }
 
@@ -373,10 +152,11 @@ static void connect_next(struct conn *c)
         px->fail_status = 502;
         atomic_fetch_add(&b->requests, 1);
         px->connecting = false;
-        px->up = px->fresh ? NULL : idle_take(c->loop, b, retry_safe(ex));
+        /* 보관된 연결은 하필 닫히는 중일 수 있다. 다시 보내도 되는 요청(GET·HEAD)만 쓴다 */
+        px->up = px->fresh || !retry_safe(ex) ? NULL : upconn_reuse(c->loop, b);
         if (px->up) {
             atomic_fetch_add(&b->reused, 1);
-        } else if (!open_upconn(c, &b->addr, b)) {
+        } else if (!open_up(c, &b->addr, b)) {
             int e = errno;
             /* 포트·fd·메모리 부족은 우리 사정이다. 백엔드 장애로 세면 멀쩡한 백엔드가 모두 빠진다 */
             bool ours = e == EMFILE || e == ENFILE || e == ENOBUFS || e == ENOMEM || e == EADDRNOTAVAIL;
@@ -399,7 +179,7 @@ void upstream_next_addr(struct conn *c, int err)
         px->fail_status = err == ETIMEDOUT ? 504 : 502;
     release(c, OUT_NEUTRAL, false);
     while (px->next_addr < px->naddr && c->loop->now < px->give_up) {
-        if (!open_upconn(c, &px->addr[px->next_addr++], NULL))
+        if (!open_up(c, &px->addr[px->next_addr++], NULL))
             continue;
         prepare(c, NULL, c->ex->host);
         return;
@@ -419,8 +199,11 @@ bool upstream_is_loop(const struct conn *c)
 {
     const struct fields *h = &c->ex->req.h;
     for (int i = 0; i < h->n; i++) {
-        char via[512];
-        if (sl_eqi(h->f[i].name, "Via") && sl_copy(h->f[i].value, via, sizeof via) && strstr(via, c->loop->srv->via))
+        if (!sl_eqi(h->f[i].name, "Via"))
+            continue;
+        char me[96]; /* "1.1 이름" 조각이 정확히 같은지. 앞부분만 같은 다른 서버를 나로 착각하지 않게 */
+        snprintf(me, sizeof me, "1.1 %s", via_name(c));
+        if (sl_list_has(h->f[i].value, me))
             return true;
     }
     return false;
@@ -435,15 +218,8 @@ static void proxy_start(struct conn *c)
         exchange_error(c, 508, NULL);
         return;
     }
-    if (cache_on(c)) {
-        char *key = cache_key(ex);
-        struct cached *o = key && cache_may_lookup(&ex->req) ? cache_get(c->loop->srv->cache, key, c->loop->now) : NULL;
-        free(key);
-        if (o) {
-            cache_start(c, o);
-            return;
-        }
-    }
+    if (caching_lookup(c))
+        return;
     px->pool = ex->route->pool;
     px->give_up = c->loop->now + 3LL * c->loop->srv->cfg->connect_ms;
     px->fail_status = 503; /* 하나도 못 골랐다 = 모두 한도까지 찼다 */
@@ -502,14 +278,16 @@ static bool recv_response(struct conn *c)
         buf_commit(&up->in, (size_t)r);
         if ((size_t)r < n)
             up->io.ready &= ~IO_R;
-        px->touched = c->loop->now;
+        if (px->head_done) /* 머리를 조금씩 흘려 보내는 것으로 제한 시간을 늘릴 수 없게 */
+            px->touched = c->loop->now;
         return true;
     }
     if (r < 0 && (errno == EAGAIN || errno == EINTR)) {
         up->io.ready &= ~IO_R;
         return false;
     }
-    px->eof = true; /* 닫힘(0)이든 끊김(오류)이든 더 올 것이 없다 */
+    px->eof = true; /* 더 올 것이 없다 */
+    px->broken = r < 0; /* 정상 닫힘이 아니라 끊김: 받은 것이 전부가 아닐 수 있다 */
     return true;
 }
 
@@ -561,7 +339,8 @@ static bool start_reply(struct conn *c, const struct http_res *res)
     enum body_kind kind = no_body ? BODY_NONE : res->chunked ? BODY_CHUNKED
                           : res->length >= 0 ? BODY_LENGTH : BODY_EOF;
     body_init(&px->dec, kind, res->length);
-    px->reusable = px->pool && res->keep && res->minor >= 1 && kind != BODY_EOF;
+    /* HEAD에 본문을 붙여 보내는 백엔드가 있다. 그 본문이 늦게 오면 다음 손님의 응답으로 읽히므로 다시 쓰지 않는다 */
+    px->reusable = px->pool && res->keep && res->minor >= 1 && kind != BODY_EOF && !ex->reply.head_only;
     px->bad_status = res->status == 502 || res->status == 503;
     px->head_done = true;
 
@@ -570,17 +349,11 @@ static bool start_reply(struct conn *c, const struct http_res *res)
     unsigned flags = 0;
     bool ok = copy_headers(res, &extra, &flags);
     if (ok)
-        saving_begin(c, res, &extra, flags);
-    if (ok && cache_on(c)) {
+        caching_begin(c, res, &extra, flags);
+    if (ok && caching_on(c))
         ok = buf_printf(&extra, "X-Cache: MISS\r\n");
-        /* 값을 바꾸는 요청이 성공했으면 저장해 둔 것은 낡았다 */
-        enum http_method m = ex->req.method;
-        char *key = m != M_GET && m != M_HEAD && m != M_OPTIONS && res->status < 400 ? cache_key(ex) : NULL;
-        if (key)
-            cache_remove(c->loop->srv->cache, key);
-        free(key);
-    }
-    ok = ok && (px->pool || buf_printf(&extra, "Via: 1.1 %s\r\n", c->loop->srv->via)) && /* 포워드 프록시의 의무 */
+    caching_invalidate(c, res->status);
+    ok = ok && (px->pool || buf_printf(&extra, "Via: 1.1 %s\r\n", via_name(c))) && /* 포워드 프록시의 의무 */
               reply_start(&ex->reply, &c->out, res->status, res->length, buf_head(&extra), buf_len(&extra), flags);
     buf_free(&extra);
     if (!ok)
@@ -656,15 +429,13 @@ static bool relay_body(struct conn *c)
             return true;
         }
         reply_write(&ex->reply, &c->out, data.p, data.n);
-        saving_add(px, data);
+        caching_add(px, data);
         buf_consume(in, (size_t)used);
         moved = true;
     }
-    if (px->saving && px->dec.done) { /* 끝까지 온전히 받은 것만 저장한다 */
-        cache_put(c->loop->srv->cache, px->saving);
-        px->saving = NULL;
-    }
-    if (px->dec.done || (px->eof && px->dec.kind == BODY_EOF)) {
+    if (px->dec.done)
+        caching_commit(c);
+    if (px->dec.done || (px->eof && !px->broken && px->dec.kind == BODY_EOF)) {
         bool sent_all = !px->send_broken && !buf_len(&px->up->out) && px->body_off == ex->body.size;
         /* 응답 뒤에 남은 바이트가 있는 연결을 다시 쓰면 다음 손님에게 엉뚱한 응답이 간다 */
         bool reuse = px->reusable && sent_all && !px->eof && !buf_len(in) && !c->loop->draining;
@@ -769,7 +540,7 @@ static void proxy_timeout(struct conn *c)
 
 static void proxy_stop(struct conn *c)
 {
-    saving_drop(px_of(c));
+    caching_drop(px_of(c));
     release(c, OUT_NEUTRAL, false);
 }
 

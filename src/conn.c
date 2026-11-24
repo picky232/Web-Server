@@ -23,7 +23,8 @@ static int evict_class(const struct conn *c)
         if (c->first_byte)
             return 2;                  /* 머리를 보내다 만 연결 */
         return c->served ? 0 : 1;      /* 쉬는 연결, 아무것도 안 보낸 연결 */
-    case CS_BODY: return 3;            /* 본문을 보내다 만 연결 */
+    case CS_BODY:                      /* 본문을 보내다 멈춘 연결. 잘 올라오는 업로드는 건드리지 않는다 */
+        return c->loop->now - c->last_in > 1000 ? 3 : -1;
     case CS_LINGER: return 0;
     default:                           /* 응답을 1초 넘게 받아 가지 않는 연결 */
         return c->send_since && c->loop->now - c->send_since > 1000 ? 4 : -1;
@@ -125,6 +126,7 @@ static void fill(struct conn *c)
     ssize_t r = p ? read(c->io.fd, p, n) : -1;
     if (r > 0) {
         buf_commit(&c->in, (size_t)r);
+        c->last_in = c->loop->now;
         if ((size_t)r < n)
             c->io.ready &= ~IO_R; /* 다 비웠다. 더 오면 커널이 다시 알려 준다 */
     } else if (r == 0) {
@@ -144,6 +146,7 @@ static bool flush(struct conn *c)
         if (r > 0) {
             buf_consume(&c->out, (size_t)r);
             c->send_bytes += r;
+            c->last_out = c->loop->now;
             moved = true;
         } else if (errno == EAGAIN || errno == EINTR) {
             break;
@@ -155,7 +158,7 @@ static bool flush(struct conn *c)
     if (!buf_len(&c->out)) {
         c->send_since = 0;
     } else if (!c->send_since) {
-        c->send_since = c->loop->now;
+        c->send_since = c->last_out = c->loop->now;
         c->send_bytes = 0;
     }
     return moved;
@@ -237,11 +240,13 @@ void conn_run(struct conn *c)
         update_interest(c);
 }
 
-/* 최소 속도 규칙: 처음 grace 동안은 봐주고, 그 뒤로는 옮긴 바이트만큼만 시간을 준다.
-   "마지막으로 움직인 때부터 30초" 식이면 29초마다 1바이트씩 보내 영원히 붙잡을 수 있다 */
-static bool too_slow(const struct conn *c, long long since, long long bytes, long long grace)
+/* 두 가지를 같이 본다.
+   평균: 처음 grace 동안은 봐주고, 그 뒤로는 옮긴 바이트만큼만 시간을 준다 (29초마다 1바이트씩 보내는 수법을 막음)
+   멈춤: 마지막으로 움직인 지 grace가 지남 (앞에서 빨리 보내 시간을 벌어 놓고 멈추는 수법을 막음) */
+static bool too_slow(const struct conn *c, long long since, long long bytes, long long last, long long grace)
 {
-    return c->loop->now - since > grace + bytes * 1000 / c->loop->srv->cfg->min_rate;
+    long long now = c->loop->now;
+    return now - since > grace + bytes * 1000 / c->loop->srv->cfg->min_rate || now - last > grace;
 }
 
 /* 모든 대기에는 끝이 있다 */
@@ -250,7 +255,7 @@ static void check_time(struct conn *c)
     const struct config *cfg = c->loop->srv->cfg;
     long long now = c->loop->now;
     bool act = false;
-    if (c->send_since && too_slow(c, c->send_since, c->send_bytes, cfg->stall_ms)) {
+    if (c->send_since && too_slow(c, c->send_since, c->send_bytes, c->last_out, cfg->stall_ms)) {
         c->reset = true; /* 받아 가지 않는 클라이언트. 남은 응답을 커널이 계속 들고 있지 않게 끊는다 */
         c->state = CS_DEAD;
         act = true;
@@ -259,11 +264,15 @@ static void check_time(struct conn *c)
         if (act)
             exchange_reject(c, 408);
     } else if (c->state == CS_HEAD) {
-        act = now - c->since > (c->served ? cfg->idle_ms : cfg->head_ms) || c->loop->draining;
+        /* 종료 중이면 쉬는 연결은 바로 닫는다. 막 받은 연결은 요청이 이미 와 있을 수 있어 1초 준다 */
+        long long limit = c->served ? cfg->idle_ms : cfg->head_ms;
+        if (c->loop->draining)
+            limit = c->served ? -1 : 1000;
+        act = now - c->since > limit;
         if (act)
             c->state = CS_DEAD;
     } else if (c->state == CS_BODY) {
-        act = too_slow(c, c->since, c->ex->body.size, cfg->head_ms);
+        act = too_slow(c, c->since, c->ex->body.size, c->last_in > c->since ? c->last_in : c->since, cfg->head_ms);
         if (act)
             exchange_error(c, 408, NULL);
     } else if (c->state == CS_RESPOND) {

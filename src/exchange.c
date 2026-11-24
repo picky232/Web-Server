@@ -104,7 +104,7 @@ static void start_handler(struct conn *c)
 static int copy_path(struct exchange *ex, bool normalize)
 {
     struct sl p = ex->target.path;
-    ex->path = malloc(p.n + 8);
+    ex->path = calloc(1, p.n + 8); /* 정리에 실패해도 항상 끝이 있는 문자열이어야 로그에 쓸 수 있다 */
     if (!ex->path)
         return 500;
     if (normalize)
@@ -136,6 +136,8 @@ static int decide_forward(struct conn *c)
     if (connect && !port_allowed(cfg, ex->port))
         return 403;
     int status = connect ? 0 : copy_path(ex, false);
+    if (!status && !connect && ex->target.asterisk)
+        strcpy(ex->path, "*");
     ex->h = connect ? &tunnel_handler : &forward_handler;
     return status;
 }
@@ -183,7 +185,9 @@ static void decide(struct conn *c, int status)
     struct sl authority = ex->target.authority.n ? ex->target.authority : r->host;
     if (status == 0 && authority.p)
         status = uri_host(authority, 80, ex->host, sizeof ex->host, &ex->port);
-    if (status == 0 && ex->target.asterisk) {
+    /* 서버 전체에 대한 OPTIONS, 또는 "여기까지만 전달"(Max-Forwards: 0)이면 직접 답한다 */
+    const struct field *hops = r->method == M_OPTIONS ? fields_find(&r->h, "Max-Forwards") : NULL;
+    if (status == 0 && ((ex->target.asterisk && c->origin != ORIGIN_FORWARD) || (hops && sl_eq(hops->value, "0")))) {
         exchange_error(c, 204, "Allow: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS\r\n");
         return;
     }

@@ -47,7 +47,8 @@ void test_cache(void)
     struct http_req *r = malloc(sizeof *r);
     CHECK(req("", r));
     const char *no[] = {"Authorization: x\r\n", "Cookie: a\r\n", "Range: bytes=0-1\r\n", "Cache-Control: no-cache\r\n",
-                        "Cache-Control: no-store\r\n", "Cache-Control: max-age=0\r\n", "Pragma: no-cache\r\n"};
+                        "Cache-Control: no-store\r\n", "Cache-Control: max-age=0\r\n", "Pragma: no-cache\r\n",
+                        "Content-Length: 3\r\n", "Transfer-Encoding: chunked\r\n"};
     for (size_t i = 0; i < sizeof no / sizeof no[0]; i++)
         CHECK_MSG(!req(no[i], r), no[i]);
     free(r);
@@ -60,6 +61,8 @@ void test_cache(void)
                            "Cache-Control: private, max-age=9\r\n", "Cache-Control: no-cache, max-age=9\r\n",
                            "Cache-Control: max-age=9\r\nSet-Cookie: a=b\r\n", "Cache-Control: max-age=9\r\nVary: Accept\r\n",
                            "Cache-Control: max-age=9\r\nAge: 9\r\n", "Cache-Control: max-age=9\r\nAge: x\r\n",
+                           "Cache-Control: max-age=60, private=\"X-User\"\r\n", "Cache-Control: max-age=60, no-cache=\"X\"\r\n",
+                           "Cache-Control: max-age=999999999999999999\r\nAge: 9223372036854776\r\n",
                            "Cache-Control: max-age=-5\r\n", "Expires: Tue, 24 Nov 2099 00:00:00 GMT\r\n"};
     for (size_t i = 0; i < sizeof never / sizeof never[0]; i++)
         CHECK_MSG(fresh("GET", "200", never[i]) == 0, never[i]);
@@ -68,23 +71,23 @@ void test_cache(void)
     CHECK(fresh("GET", "404", "Cache-Control: max-age=9\r\n") == 0);
 
     struct cache *c = cache_new(16 * 10000); /* 조각 하나에 10000바이트 */
-    cache_put(c, obj("a", 100, 0, 1000));
+    cache_put(c, obj("a", 100, 0, 1000), cache_generation(c, "x"));
     CHECK(has(c, "a", 999) && !has(c, "b", 0) && !has(c, "a", 1000)); /* 1000에서 만료 */
     CHECK(!has(c, "a", 0)); /* 만료된 것은 없어진다 */
-    cache_put(c, obj("a", 100, 0, 1000));
-    cache_put(c, obj("a", 200, 0, 1000)); /* 덮어쓰기 */
+    cache_put(c, obj("a", 100, 0, 1000), cache_generation(c, "x"));
+    cache_put(c, obj("a", 200, 0, 1000), cache_generation(c, "x")); /* 덮어쓰기 */
     struct cached *o = cache_get(c, "a", 1);
     CHECK(o && o->body_n == 200);
     cache_remove(c, "a"); /* 보내는 중인 응답은 지워져도 끝까지 쓸 수 있다 */
     CHECK(!has(c, "a", 1) && o->body_n == 200 && o->body[199] == 0);
     cached_unref(o);
-    cache_put(c, obj("huge", 20000, 0, 1000)); /* 조각보다 크면 저장하지 않는다 */
+    cache_put(c, obj("huge", 20000, 0, 1000), cache_generation(c, "x")); /* 조각보다 크면 저장하지 않는다 */
     CHECK(!has(c, "huge", 1));
     long long hits, misses, bytes, count;
     char key[32];
     for (int i = 0; i < 2000; i++) {
         snprintf(key, sizeof key, "k%d", i);
-        cache_put(c, obj(key, 1000, 0, 100000));
+        cache_put(c, obj(key, 1000, 0, 100000), cache_generation(c, "x"));
         CHECK(has(c, "k0", 1) || i > 0); /* 계속 쓰이는 것은 */
         (void)has(c, "k0", 1);
     }

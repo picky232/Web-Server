@@ -167,6 +167,17 @@ int net_local_port(int fd)
     return getsockname(fd, (struct sockaddr *)&a.ss, &a.len) < 0 ? 0 : net_port(&a);
 }
 
+bool net_is_bound_to(int fd, const struct addr *a)
+{
+    struct addr b = {.len = sizeof b.ss};
+    char x[64], y[64];
+    if (getsockname(fd, (struct sockaddr *)&b.ss, &b.len) < 0 || a->ss.ss_family != b.ss.ss_family)
+        return false;
+    net_ip(a, x, sizeof x);
+    net_ip(&b, y, sizeof y);
+    return !strcmp(x, y) && (net_port(a) == 0 || net_port(a) == net_port(&b));
+}
+
 bool net_is_loopback(const struct addr *a)
 {
     if (a->ss.ss_family == AF_INET6)

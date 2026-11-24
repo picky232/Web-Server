@@ -3,6 +3,8 @@
 
 #include "net.h"
 
+#include <stdatomic.h>
+
 struct conn;
 struct loop;
 
@@ -14,6 +16,7 @@ struct resolve {
     char host[256], port[8];
     struct loop *loop;
     struct conn *c; /* 루프 스레드만 만진다. 그 사이 손님이 떠나면 NULL */
+    atomic_bool cancelled; /* 손님이 떠났다. 아직 대기열에 있으면 해석하지 않고 버린다 */
     bool ok;
     struct addr addr[RESOLVE_MAX];
     int n;

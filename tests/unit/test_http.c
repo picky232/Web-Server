@@ -134,7 +134,8 @@ static void responses(void)
     CHECK(res("HTTP/1.0 200 OK\r\n\r\n", r) && !r->keep && r->length == -1);
     /* 둘 다 있으면 Transfer-Encoding이 이긴다 */
     CHECK(res("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n", r) && r->chunked && r->length == -1);
-    CHECK(res("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", r) && r->until_close && !r->chunked);
+    CHECK(!res("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", r));
+    CHECK(!res("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n", r));
     CHECK(res("HTTP/1.1 200 OK\r\nX-A : b\r\n\r\n", r) && fields_find(&r->h, "x-a"));
     CHECK(res("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n", r) && r->length == 3);
     const char *bad[] = {"HTTP/1.1 20 OK\r\n\r\n", "HTTP/2.0 200 OK\r\n\r\n", "HTTP/1.1 2x0 OK\r\n\r\n",

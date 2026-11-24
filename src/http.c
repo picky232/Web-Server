@@ -226,8 +226,10 @@ bool http_parse_response(const char *p, size_t n, struct http_res *r)
         return false;
     r->length = -1;
     if (te) { /* Transfer-Encoding이 있으면 Content-Length는 무시한다 (RFC 9112 6.3) */
+        /* chunked 하나가 아니면 본문을 풀 수 없다. 그대로 넘기면 깨진 본문이 200으로 나간다 */
         r->chunked = count(&r->h, "Transfer-Encoding") == 1 && sl_eqi(te->value, "chunked");
-        r->until_close = !r->chunked;
+        if (!r->chunked)
+            return false;
     } else {
         for (int i = 0; i < r->h.n; i++) {
             long long v;

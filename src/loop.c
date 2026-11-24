@@ -90,8 +90,7 @@ static void read_mail(struct loop *l)
                 forward_resolved(m[i].ptr);
                 free(m[i].ptr);
                 break;
-            case MSG_DRAIN: l->draining = true; break;
-            case MSG_KILL: l->draining = l->quit = true; break;
+            case MSG_WAKE: break;
             }
         }
     }
@@ -106,6 +105,9 @@ static void *loop_main(void *arg)
         int n = ev_wait(l->evfd, ev, MAX_EVENTS, l->ready ? 0 : l->reaping ? REAP_MS : SCAN_MS);
         long long woke = now_us();
         l->now = woke / 1000;
+        int phase = atomic_load(&l->srv->phase);
+        l->draining = phase >= PHASE_DRAIN;
+        l->quit = phase >= PHASE_KILL;
         for (int i = 0; i < n; i++) {
             struct io *io = ev[i].io;
             if (io->dead)
@@ -133,8 +135,11 @@ static void *loop_main(void *arg)
         long long busy = now_us() - woke;
         if (busy > atomic_load_explicit(&l->max_busy_us, memory_order_relaxed))
             atomic_store_explicit(&l->max_busy_us, busy, memory_order_relaxed);
-        if (l->draining && !l->conns)
-            break;
+        if (l->draining && !l->conns) {
+            read_mail(l); /* 종료 직전에 받은 연결이 쪽지함에 남아 있을 수 있다 */
+            if (!l->conns)
+                break;
+        }
     }
     conn_close_all(l);
     upstream_close_all(l);

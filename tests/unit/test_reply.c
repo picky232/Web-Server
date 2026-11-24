@@ -77,6 +77,15 @@ void test_reply(void)
     CHECK(room > 60000 && reply_room(&r, &out) == 0);
     free(big);
 
+    struct buf small; /* 메모리(여기서는 자리)가 모자라 일부를 못 썼으면 끝까지 보낸 척하지 않는다 */
+    buf_init(&small, 400);
+    r = (struct reply){.minor = 1, .keep = true};
+    CHECK(reply_start(&r, &small, 200, 1000, "", 0, 0));
+    char thousand[1000] = {0};
+    reply_write(&r, &small, thousand, 1000);
+    CHECK(!reply_finish(&r, &small));
+    buf_free(&small);
+
     buf_free(&out); /* 머리가 안 들어가면 실패하고 아무것도 쓰지 않는다 */
     struct buf tiny;
     buf_init(&tiny, 50);

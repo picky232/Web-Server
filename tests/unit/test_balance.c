@@ -94,7 +94,7 @@ static void exclude_rules(void)
 static void request_head(void)
 {
     const char *raw = "POST http://Ex.com:81/x HTTP/1.1\r\nHost: ignored\r\nConnection: A, close\r\nA: 1\r\nB: 2\r\n"
-                      "X-Forwarded-For: 9.9.9.9\r\nExpect: 100-continue\r\nContent-Length: 3\r\nProxy-Connection: x\r\nVia: 1.0 p\r\n\r\n";
+                      "X-Forwarded-For: 9.9.9.9\r\nX_Forwarded_For: 9.9.9.9\r\nExpect: 100-continue\r\nContent-Length: 3\r\nProxy-Connection: x\r\nVia: 1.0 p\r\n\r\n";
     struct exchange *ex = calloc(1, sizeof *ex);
     CHECK(http_parse_request(raw, strlen(raw), &ex->req) == 0);
     CHECK(uri_split(ex->req.target, ex->req.method, &ex->target) == 0);

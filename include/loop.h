@@ -14,7 +14,7 @@ struct idle_list;
 struct child;
 
 /* 메인 스레드가 루프 스레드에 보내는 쪽지. 파이프로 통째로 전달된다 (512바이트 이하는 쪼개지지 않음) */
-enum msg_type { MSG_CONN, MSG_DRAIN, MSG_KILL, MSG_RESOLVED };
+enum msg_type { MSG_CONN, MSG_RESOLVED, MSG_WAKE };
 struct msg {
     enum msg_type type;
     int fd;

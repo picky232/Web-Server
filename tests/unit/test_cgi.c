@@ -32,9 +32,10 @@ void test_cgi(void)
         CHECK_MSG(!head(bad[i], &st, &len, &x), bad[i]);
     buf_free(&x);
 
-    const char *raw = "POST /cgi/a HTTP/1.1\r\nHost: h\r\nContent-Type: t/p\r\nProxy: evil\r\nAuthorization: s\r\nX-Y: 1\r\nX_Z: 2\r\nConnection: Q\r\nQ: 3\r\n\r\n";
+    const char *raw = "POST http://good/cgi/a HTTP/1.1\r\nHost: evil\r\nX-M: 1\r\nCookie: a=1\r\nx-m: 2\r\nCookie: b=2\r\nContent-Type: t/p\r\nProxy: evil\r\nAuthorization: s\r\nX-Y: 1\r\nX_Z: 2\r\nConnection: Q\r\nQ: 3\r\n\r\n";
     struct exchange *ex = calloc(1, sizeof *ex);
     CHECK(http_parse_request(raw, strlen(raw), &ex->req) == 0);
+    CHECK(uri_split(ex->req.target, M_POST, &ex->target) == 0);
     ex->target.query = (struct sl){"?a=b", 4};
     ex->body.size = 9;
     CHECK(cgi_env(ex, "1.2.3.4", 80, "/cgi/a", "/i", &x));
@@ -44,7 +45,7 @@ void test_cgi(void)
         strcat(joined, "\n");
     }
     const char *want[] = {"REQUEST_METHOD=POST\n", "QUERY_STRING=a=b\n", "CONTENT_LENGTH=9\n", "CONTENT_TYPE=t/p\n", "PATH_INFO=/i\n",
-                          "HTTP_X_Y=1\n", "REMOTE_ADDR=1.2.3.4\n", "SERVER_PORT=80\n"};
+                          "HTTP_X_Y=1\n", "HTTP_HOST=good\n", "HTTP_X_M=1, 2\n", "HTTP_COOKIE=a=1; b=2\n", "REMOTE_ADDR=1.2.3.4\n", "SERVER_PORT=80\n"};
     for (size_t i = 0; i < sizeof want / sizeof want[0]; i++)
         CHECK_MSG(strstr(joined, want[i]), want[i]);
     const char *gone[] = {"HTTP_PROXY", "AUTHORIZATION", "X_Z", "HTTP_Q", "HTTP_CONNECTION"};

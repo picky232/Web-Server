@@ -41,7 +41,6 @@ struct http_res {
     struct fields h;
     long long length;
     bool chunked;
-    bool until_close; /* 모르는 전송 방식이라 닫힐 때까지가 본문 */
     bool keep;
 };
 

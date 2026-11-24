@@ -26,6 +26,7 @@ void net_nodelay(int fd);
 void net_ip(const struct addr *a, char *out, size_t cap);
 int net_port(const struct addr *a);
 int net_local_port(int fd);
+bool net_is_bound_to(int fd, const struct addr *a); /* fd가 정말 그 주소에서 듣고 있나 (포트 0은 아무 포트) */
 bool net_is_loopback(const struct addr *a);
 bool net_is_private(const struct addr *a); /* 바깥에서 닿으면 안 되는 내부·특수 주소 */
 

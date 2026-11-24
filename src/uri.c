@@ -8,9 +8,9 @@ int uri_split(struct sl s, enum http_method m, struct target *t)
     memset(t, 0, sizeof *t);
     if (memchr(s.p, '#', s.n))
         return 400;
-    if (m == M_CONNECT) {
+    if (m == M_CONNECT) { /* 포트가 반드시 있어야 한다 */
         t->authority = s;
-        return 0;
+        return s.n && s.p[s.n - 1] >= '0' && s.p[s.n - 1] <= '9' && memchr(s.p, ':', s.n) ? 0 : 400;
     }
     if (sl_eq(s, "*")) {
         t->asterisk = true;
@@ -34,6 +34,8 @@ int uri_split(struct sl s, enum http_method m, struct target *t)
     }
     const char *q = memchr(s.p, '?', s.n);
     size_t plen = q ? (size_t)(q - s.p) : s.n;
+    if (t->absolute && s.n == 0 && m == M_OPTIONS)
+        t->asterisk = true; /* "OPTIONS http://host" = 서버 전체에 대한 질문 */
     t->path = plen ? (struct sl){s.p, plen} : (struct sl){"/", 1};
     if (q)
         t->query = (struct sl){q, s.n - plen};

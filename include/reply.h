@@ -12,6 +12,7 @@ struct reply {
     bool head_only; /* HEAD 요청: 머리만 보낸다 */
     bool keep;      /* 응답 뒤 연결을 유지할 것인가 */
     bool started, finished;
+    bool broken;    /* 메모리가 모자라 일부를 못 썼다 → 끝까지 보낸 척하면 안 된다 */
     int status;
     enum framing framing;
     long long left; /* FRAME_LENGTH에서 아직 안 보낸 바이트 */

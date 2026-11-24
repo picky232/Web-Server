@@ -1,4 +1,5 @@
 #include "health.h"
+#include "log.h"
 #include "net.h"
 
 #include <errno.h>
@@ -19,6 +20,7 @@ struct check {
     size_t got;
     long long started, next_at;
     int fails, oks;
+    bool was_down;
 };
 
 static struct check *g_checks;
@@ -57,10 +59,10 @@ static void verdict(struct check *k, bool ok, long long now)
     k->oks = ok ? k->oks + 1 : 0;
     if (k->oks >= RISE && atomic_exchange(&k->be->down, false)) {
         atomic_store(&k->be->timeouts, 0);
-        fprintf(stderr, "백엔드 복귀: %s %s (헬스 체크 %d번 연속 성공)\n", k->pool->name, k->be->name, RISE);
+        log_note("백엔드 복귀: %s %s (헬스 체크 %d번 연속 성공)", k->pool->name, k->be->name, RISE);
     }
     if (k->fails >= FALL && !atomic_exchange(&k->be->down, true))
-        fprintf(stderr, "백엔드 제외: %s %s (헬스 체크 %d번 연속 실패)\n", k->pool->name, k->be->name, FALL);
+        log_note("백엔드 제외: %s %s (헬스 체크 %d번 연속 실패)", k->pool->name, k->be->name, FALL);
 }
 
 static void begin(struct check *k, long long now)
@@ -88,6 +90,13 @@ void health_tick(long long now)
     long long limit = g_cfg->health_ms < 1000 ? g_cfg->health_ms : 1000;
     for (int i = 0; i < g_n; i++) {
         struct check *k = &g_checks[i];
+        /* 요청 처리 중에 제외됐다면 그 뒤의 성공부터 다시 센다 */
+        bool down = atomic_load(&k->be->down);
+        if (down && !k->was_down) {
+            k->oks = 0;
+            close_check(k);
+        }
+        k->was_down = down;
         if (k->active && now - k->started > limit)
             verdict(k, false, now);
         if (!k->active && now >= k->next_at)

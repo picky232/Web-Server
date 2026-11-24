@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -39,6 +40,11 @@ static bool envs(struct buf *out, const char *name, const char *v)
     return env(out, name, (struct sl){v, strlen(v)});
 }
 
+static bool same_name(struct sl a, struct sl b)
+{
+    return a.n == b.n && !strncasecmp(a.p, b.p, a.n);
+}
+
 /* "이름=값\0" 을 이어 붙인다. 우리 서버의 환경 변수는 물려주지 않는다 (비밀 값이 샐 수 있다) */
 bool cgi_env(const struct exchange *ex, const char *ip, int port, const char *script, const char *info, struct buf *out)
 {
@@ -56,6 +62,11 @@ bool cgi_env(const struct exchange *ex, const char *ip, int port, const char *sc
         ok = envs(out, "CONTENT_LENGTH", num);
     for (int i = 0; ok && i < r->h.n; i++) {
         struct sl name = r->h.f[i].name;
+        bool seen = false; /* 같은 이름이 여러 줄이면 처음 나온 자리에서 하나로 합친다 */
+        for (int k = 0; k < i && !seen; k++)
+            seen = same_name(r->h.f[k].name, name);
+        if (seen)
+            continue;
         if (sl_eqi(name, "Content-Type")) {
             ok = env(out, "CONTENT_TYPE", r->h.f[i].value);
             continue;
@@ -73,8 +84,18 @@ bool cgi_env(const struct exchange *ex, const char *ip, int port, const char *sc
             key[5 + k] = ch == '-' ? '_' : (char)(ch >= 'a' && ch <= 'z' ? ch - 32 : ch);
         }
         key[5 + name.n] = '\0';
-        if (plain)
-            ok = env(out, key, r->h.f[i].value);
+        if (!plain)
+            continue;
+        if (sl_eqi(name, "Host") && ex->target.absolute) { /* 주소에 적힌 호스트가 Host 헤더보다 먼저다 */
+            ok = env(out, key, ex->target.authority);
+            continue;
+        }
+        ok = buf_printf(out, "%s=", key) && buf_append(out, r->h.f[i].value.p, r->h.f[i].value.n);
+        for (int k = i + 1; ok && k < r->h.n; k++)
+            if (same_name(r->h.f[k].name, name))
+                ok = buf_append(out, sl_eqi(name, "Cookie") ? "; " : ", ", 2) &&
+                     buf_append(out, r->h.f[k].value.p, r->h.f[k].value.n);
+        ok = ok && buf_append(out, "", 1);
     }
     return ok;
 }
@@ -126,6 +147,10 @@ void cgi_reap(struct loop *l, bool force)
     l->reaping = false;
     while (*pp) {
         struct child *ch = *pp;
+        if (!force && !ch->kill_at) { /* 아직 응답 중인 요청이 쓰고 있다. 놓은 뒤에만 회수한다 */
+            pp = &ch->next;
+            continue;
+        }
         siginfo_t si;
         memset(&si, 0, sizeof si);
         /* 먼저 끝났는지만 보고(WNOWAIT), 그룹에 남은 손자를 정리한 뒤 회수한다.
@@ -342,6 +367,10 @@ static bool cgi_pump(struct conn *c)
         buf_consume(&p->in, hl);
         s->head_done = true;
         moved = true;
+    }
+    if (ex->reply.framing == FRAME_NONE || (ex->reply.framing == FRAME_LENGTH && ex->reply.left == 0)) {
+        exchange_finish(c); /* 더 보낼 것이 없다. 프로그램이 계속 출력해도 기다리지 않는다 */
+        return true;
     }
     size_t n = reply_room(&ex->reply, &c->out);
     if (n > buf_len(&p->in))

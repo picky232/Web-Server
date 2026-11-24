@@ -45,10 +45,12 @@ struct proxy_st {
     int interim;           /* 지나간 1xx 응답 수 */
     bool head_done;
     bool eof;
+    bool broken; /* eof가 정상 닫힘이 아니라 끊김이었다 */
     bool reusable, bad_status;
     struct body_dec dec;
     struct cached *saving; /* 응답을 중계하면서 같이 모으는 캐시 사본 */
     size_t saving_cap;
+    unsigned cache_gen;
     /* 포워드 프록시: 백엔드 묶음 대신 이름 해석 결과로 접속한다 */
     struct resolve *asking; /* 이름 해석을 기다리는 중 */
     struct addr addr[RESOLVE_MAX];
@@ -67,6 +69,9 @@ void upstream_event(struct upconn *up); /* 백엔드 소켓에 일이 생겼다 
 void upstream_scan(struct loop *l);     /* 오래 쉰 연결 정리 */
 void upstream_close_all(struct loop *l);
 void upconn_free(struct upconn *up);
+struct upconn *upconn_open(struct loop *l, const struct addr *a, struct backend *b); /* 연결을 시작만 한다 */
+struct upconn *upconn_reuse(struct loop *l, struct backend *b);                     /* 보관함에서 꺼낸다. 없으면 NULL */
+void upconn_keep(struct upconn *up);                                                /* 보관함에 넣는다 */
 
 /* 시험할 수 있게 떼어 둔 순수 함수: 클라이언트 요청 → 백엔드로 보낼 요청 머리.
    ip가 NULL이면 포워드 프록시: X-Forwarded-*를 더하지도 지우지도 않는다 */

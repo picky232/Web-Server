@@ -35,6 +35,7 @@ struct conn {
     long long first_byte; /* 이번 요청의 첫 바이트가 온 시각. 0 = 아직 */
     long long send_since; /* out이 밀리기 시작한 시각. 0 = 밀리지 않음 */
     long long send_bytes; /* 그 뒤로 보낸 바이트 (느린 수신자 판정용) */
+    long long last_in, last_out; /* 마지막으로 바이트를 받은·보낸 시각 */
     size_t lingered;      /* LINGER에서 버린 바이트 */
     int served;           /* 이 연결에서 받은 요청 수 */
     struct exchange *ex;  /* 지금 처리 중인 요청. 없으면 NULL */

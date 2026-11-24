@@ -51,7 +51,8 @@ static void *worker(void *arg)
         g_waiting--;
         pthread_mutex_unlock(&g_lock);
 
-        lookup(r); /* 여기서만 기다린다. 락은 놓은 상태 */
+        if (!atomic_load(&r->cancelled))
+            lookup(r); /* 여기서만 기다린다. 락은 놓은 상태 */
 
         struct msg m = {.type = MSG_RESOLVED, .ptr = r};
         pthread_mutex_lock(&g_lock);
@@ -89,16 +90,7 @@ struct resolve *resolver_ask(struct loop *l, struct conn *c, const char *host, i
     struct resolve *r = calloc(1, sizeof *r);
     if (!r)
         return NULL;
-    size_t n = strlen(host);
-    if (n >= 2 && host[0] == '[') { /* [::1] → ::1 */
-        host++;
-        n -= 2;
-    }
-    if (n >= sizeof r->host) {
-        free(r);
-        return NULL;
-    }
-    memcpy(r->host, host, n);
+    snprintf(r->host, sizeof r->host, "%s", host);
     snprintf(r->port, sizeof r->port, "%d", port);
     r->loop = l;
     r->c = c;

@@ -29,7 +29,10 @@ struct cache;
 struct cache *cache_new(long long max_bytes);
 void cache_free(struct cache *c);
 struct cached *cache_get(struct cache *c, const char *key, long long now); /* 신선한 것만. 다 쓰면 cache_unref */
-void cache_put(struct cache *c, struct cached *o); /* 소유권을 넘긴다 */
+/* 소유권을 넘긴다. gen은 요청을 백엔드로 보내기 전에 적어 둔 세대 번호.
+   그 사이 값을 바꾸는 요청이 지나갔으면 저장하지 않는다 */
+void cache_put(struct cache *c, struct cached *o, unsigned gen);
+unsigned cache_generation(struct cache *c, const char *key);
 void cache_remove(struct cache *c, const char *key);
 void cached_unref(struct cached *o);
 void cache_stats(struct cache *c, long long *hits, long long *misses, long long *bytes, long long *count);

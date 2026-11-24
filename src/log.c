@@ -3,7 +3,12 @@
 #include "loop.h"
 #include "server.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -33,14 +38,52 @@ void log_access(struct conn *c)
         atomic_fetch_add(&l->log_dropped, 1);
 }
 
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 막히지 않고 쓸 수 있는 만큼만 쓴다. 파이프는 "쓸 수 있음"이라고 해도 PIPE_BUF까지만 보장되므로,
+   더 큰 덩어리를 한 번에 쓰면 그 안에서 잠들 수 있다. 루프가 잠들면 그 루프의 모든 손님이 멈춘다 */
+static size_t write_some(int fd, const char *p, size_t n, bool regular)
+{
+    size_t done = 0;
+    while (done < n) {
+        struct pollfd pf = {.fd = fd, .events = POLLOUT};
+        if (!regular && poll(&pf, 1, 0) != 1)
+            break;
+        size_t k = n - done;
+        if (!regular && k > PIPE_BUF)
+            k = PIPE_BUF;
+        ssize_t w = write(fd, p + done, k);
+        if (w < 0 && (errno == EAGAIN || errno == EINTR))
+            break;
+        if (w <= 0)
+            return n; /* 받는 쪽이 사라졌다. 쌓아 둘 이유가 없다 */
+        done += (size_t)w;
+    }
+    return done;
+}
+
 void log_flush(struct loop *l)
 {
-    if (!buf_len(&l->log))
+    /* 확인과 쓰기 사이에 다른 루프가 자리를 가져가지 않게 한 번에 하나만. 바쁘면 다음 바퀴에 */
+    if (!buf_len(&l->log) || pthread_mutex_trylock(&g_lock) != 0)
         return;
-    /* 로그를 받는 쪽(파이프)이 막혀 있으면 기다리지 않는다. 루프가 멈추면 모든 손님이 멈춘다 */
-    struct pollfd p = {.fd = l->srv->log_fd, .events = POLLOUT};
-    if (poll(&p, 1, 0) != 1)
+    buf_consume(&l->log, write_some(l->srv->log_fd, buf_head(&l->log), buf_len(&l->log), l->srv->log_regular));
+    pthread_mutex_unlock(&g_lock);
+}
+
+void log_note(const char *fmt, ...)
+{
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof line - 1, fmt, ap);
+    va_end(ap);
+    if (n < 0)
         return;
-    ssize_t w = write(l->srv->log_fd, buf_head(&l->log), buf_len(&l->log));
-    buf_consume(&l->log, w > 0 ? (size_t)w : buf_len(&l->log));
+    if ((size_t)n > sizeof line - 2)
+        n = (int)sizeof line - 2;
+    line[n++] = '\n';
+    pthread_mutex_lock(&g_lock); /* 쥔 쪽이 기다리는 일이 없으므로 오래 잡히지 않는다 */
+    write_some(STDERR_FILENO, line, (size_t)n, false);
+    pthread_mutex_unlock(&g_lock);
 }

@@ -91,11 +91,16 @@ void reply_write(struct reply *r, struct buf *out, const char *p, size_t n)
         n = (size_t)r->left; /* 약속보다 많이 보내면 다음 응답 자리에 섞인다 */
     if (n == 0)
         return; /* 크기 0인 조각은 "끝"이라는 뜻이므로 쓰면 안 된다 */
+    bool ok = !r->broken;
     if (r->framing == FRAME_CHUNKED)
-        buf_printf(out, "%zx\r\n", n);
-    buf_append(out, p, n);
+        ok = ok && buf_printf(out, "%zx\r\n", n);
+    ok = ok && buf_append(out, p, n);
     if (r->framing == FRAME_CHUNKED)
-        buf_append(out, "\r\n", 2);
+        ok = ok && buf_append(out, "\r\n", 2);
+    if (!ok) {
+        r->broken = true;
+        return;
+    }
     if (r->framing == FRAME_LENGTH)
         r->left -= (long long)n;
     r->sent += (long long)n;
@@ -103,10 +108,10 @@ void reply_write(struct reply *r, struct buf *out, const char *p, size_t n)
 
 bool reply_finish(struct reply *r, struct buf *out)
 {
-    if (r->framing == FRAME_LENGTH && r->left > 0)
+    if (r->broken || (r->framing == FRAME_LENGTH && r->left > 0))
         return false;
-    if (r->framing == FRAME_CHUNKED)
-        buf_append(out, "0\r\n\r\n", 5);
+    if (r->framing == FRAME_CHUNKED && !buf_append(out, "0\r\n\r\n", 5))
+        return false;
     r->finished = true;
     return true;
 }

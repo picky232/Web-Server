@@ -15,6 +15,7 @@ struct shard {
     struct cached *bucket[BUCKETS];
     struct cached *newest, *oldest, *hand;
     long long bytes, max, count;
+    unsigned gen; /* 지울 때마다 올라간다 */
 };
 struct cache {
     struct shard s[SHARDS];
@@ -115,13 +116,27 @@ static void evict(struct shard *s)
     unlink_one(s, o);
 }
 
-void cache_put(struct cache *c, struct cached *o)
+unsigned cache_generation(struct cache *c, const char *key)
+{
+    struct shard *s = &c->s[hash(key) % SHARDS];
+    pthread_mutex_lock(&s->lock);
+    unsigned g = s->gen;
+    pthread_mutex_unlock(&s->lock);
+    return g;
+}
+
+void cache_put(struct cache *c, struct cached *o, unsigned gen)
 {
     unsigned h = hash(o->key);
     struct shard *s = &c->s[h % SHARDS];
     long long size = size_of(o);
     atomic_store(&o->refs, 1);
     pthread_mutex_lock(&s->lock);
+    if (gen != s->gen) { /* 이 응답을 받는 사이에 값이 바뀌었을 수 있다 */
+        pthread_mutex_unlock(&s->lock);
+        cached_unref(o);
+        return;
+    }
     struct cached *old = *find(s, h, o->key);
     if (old)
         unlink_one(s, old);
@@ -154,6 +169,7 @@ void cache_remove(struct cache *c, const char *key)
     struct cached *o = *find(s, h, key);
     if (o)
         unlink_one(s, o);
+    s->gen++;
     pthread_mutex_unlock(&s->lock);
 }
 
@@ -187,8 +203,8 @@ void cache_free(struct cache *c)
 bool cache_may_lookup(const struct http_req *r)
 {
     static const char *const no[] = {"Authorization", "Cookie", "Range"}; /* 손님마다 답이 다를 수 있다 */
-    if (r->method != M_GET && r->method != M_HEAD)
-        return false;
+    if ((r->method != M_GET && r->method != M_HEAD) || r->chunked || r->length > 0)
+        return false; /* 본문이 있는 GET은 본문에 따라 답이 다를 수 있는데, 본문은 키에 없다 */
     for (size_t i = 0; i < sizeof no / sizeof no[0]; i++)
         if (fields_find(&r->h, no[i]))
             return false;
@@ -226,6 +242,9 @@ long long cache_fresh_ms(const struct http_req *r, const struct http_res *s, lon
     for (size_t i = 0; i < sizeof tokens / sizeof tokens[0]; i++)
         if (fields_token(&s->h, "Cache-Control", tokens[i]))
             return 0;
+    /* private="X-User"처럼 값이 붙은 모양도 개인 응답이다 */
+    if (seconds_of(&s->h, "private") >= 0 || seconds_of(&s->h, "no-cache") >= 0)
+        return 0;
     /* Vary가 있으면 요청 헤더마다 다른 답이라는 뜻, Set-Cookie가 있으면 개인 응답일 수 있다 */
     if (fields_find(&s->h, "Set-Cookie") || fields_find(&s->h, "Vary") || fields_find(&s->h, "Pragma"))
         return 0;
@@ -236,10 +255,10 @@ long long cache_fresh_ms(const struct http_req *r, const struct http_res *s, lon
     const struct field *f = fields_find(&s->h, "Age");
     if (f && !sl_to_ll(f->value, &age))
         return 0;
-    if (sec <= age)
-        return 0;
     if (sec > 86400)
         sec = 86400; /* 하루를 넘겨 들고 있지 않는다 */
+    if (sec <= age)
+        return 0;
     *age_ms = age * 1000;
     return sec * 1000;
 }

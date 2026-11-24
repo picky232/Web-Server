@@ -19,6 +19,20 @@ static struct proxy_st *px_of(struct conn *c)
     return &c->ex->u.proxy;
 }
 
+/* 이름이 아니라 실제로 접속할 주소를 검사한다. 이름만 보면 DNS로 내부 주소를 돌려주어 우회할 수 있다.
+   내 컴퓨터에만 열린 프록시라면 내부 주소도 허용한다 (설정 글자가 아니라 실제 소켓 주소로 판단) */
+static void connect_to(struct conn *c, const struct addr *a, int n)
+{
+    struct proxy_st *px = px_of(c);
+    for (int i = 0; i < n; i++)
+        if (c->loop->srv->forward_loopback || !net_is_private(&a[i]))
+            px->addr[px->naddr++] = a[i];
+    if (px->naddr)
+        upstream_connect_addrs(c);
+    else
+        exchange_error(c, 403, NULL);
+}
+
 static void ask(struct conn *c)
 {
     struct exchange *ex = c->ex;
@@ -29,10 +43,21 @@ static void ask(struct conn *c)
         return;
     }
     snprintf(ex->served_by, sizeof ex->served_by, "%.80s:%d", ex->host, ex->port);
-    px->asking = resolver_ask(c->loop, c, ex->host, ex->port);
+    ex->deadline = c->loop->now + c->loop->srv->cfg->response_ms;
+
+    char host[256], port[8];
+    size_t n = strlen(ex->host);
+    bool v6 = ex->host[0] == '['; /* [::1] → ::1 */
+    snprintf(host, sizeof host, "%.*s", (int)(v6 ? n - 2 : n), ex->host + v6);
+    snprintf(port, sizeof port, "%d", ex->port);
+    struct addr a;
+    if (net_parse_hostport(host, port, true, &a)) { /* 숫자 주소는 해석할 것이 없다 */
+        connect_to(c, &a, 1);
+        return;
+    }
+    px->asking = resolver_ask(c->loop, c, host, ex->port);
     if (!px->asking)
         exchange_error(c, 503, "Retry-After: 1\r\n");
-    ex->deadline = c->loop->now + c->loop->srv->cfg->response_ms;
 }
 
 void forward_resolved(struct resolve *r)
@@ -40,20 +65,11 @@ void forward_resolved(struct resolve *r)
     struct conn *c = r->c;
     if (!c)
         return; /* 기다리던 손님이 떠났다 */
-    struct proxy_st *px = px_of(c);
-    const struct config *cfg = c->loop->srv->cfg;
-    px->asking = NULL;
-    /* 이름이 아니라 실제로 접속할 주소를 검사한다. 이름만 보면 DNS로 내부 주소를 돌려주어 우회할 수 있다.
-       내 컴퓨터에서만 쓰는 프록시라면 내부 주소도 허용한다 */
-    for (int i = 0; i < r->n; i++)
-        if (net_is_loopback(&cfg->forward) || !net_is_private(&r->addr[i]))
-            px->addr[px->naddr++] = r->addr[i];
-    if (!r->ok)
-        exchange_error(c, 502, NULL);
-    else if (px->naddr == 0)
-        exchange_error(c, 403, NULL);
+    px_of(c)->asking = NULL;
+    if (r->ok)
+        connect_to(c, r->addr, r->n);
     else
-        upstream_connect_addrs(c);
+        exchange_error(c, 502, NULL);
     conn_run(c);
 }
 
@@ -67,8 +83,10 @@ static void forward_timeout(struct conn *c)
 
 static void forward_stop(struct conn *c)
 {
-    if (px_of(c)->asking)
-        px_of(c)->asking->c = NULL; /* 쪽지가 도착하면 그때 해제된다 */
+    if (px_of(c)->asking) { /* 결과 쪽지가 도착하면 그때 해제된다 */
+        px_of(c)->asking->c = NULL;
+        atomic_store(&px_of(c)->asking->cancelled, true);
+    }
     px_of(c)->asking = NULL;
     proxy_handler.stop(c);
 }

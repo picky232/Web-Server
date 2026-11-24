@@ -1,4 +1,5 @@
 #include "health.h"
+#include "log.h"
 #include "net.h"
 #include "resolver.h"
 #include "server.h"
@@ -12,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int g_sig_pipe[2];
@@ -36,6 +38,8 @@ static void setup_signals(void)
     sa.sa_handler = on_signal;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sa.sa_handler = SIG_DFL; /* 무시 상태를 물려받으면 커널이 CGI 자식을 알아서 치워 우리가 회수할 수 없다 */
+    sigaction(SIGCHLD, &sa, NULL);
     sa.sa_handler = SIG_IGN; /* 끊긴 연결에 쓰면 프로세스가 죽는 대신 EPIPE를 받는다 */
     sigaction(SIGPIPE, &sa, NULL);
 }
@@ -55,8 +59,10 @@ static struct loop *pick_loop(struct server *s)
 
 static int g_spare_fd; /* fd가 바닥났을 때 잠깐 내놓을 예비 fd */
 
-/* 새 연결을 받아 루프에 나눠 준다. fd가 바닥나서 쉬어야 하면 false */
-static bool accept_some(struct server *s, int lfd, int origin)
+enum accepted { ACCEPT_EMPTY, ACCEPT_MORE, ACCEPT_PAUSE };
+
+/* 새 연결을 받아 루프에 나눠 준다. 더 있을 수 있으면 MORE, fd가 바닥나서 쉬어야 하면 PAUSE */
+static enum accepted accept_some(struct server *s, int lfd, int origin)
 {
     for (int i = 0; i < 64; i++) { /* 한 번에 64개까지. 나머지는 다음 바퀴에 다시 알려 준다 */
         struct msg m = {.type = MSG_CONN, .origin = origin};
@@ -69,10 +75,12 @@ static bool accept_some(struct server *s, int lfd, int origin)
             if (fd >= 0)
                 close(fd);
             g_spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
-            return false;
+            return ACCEPT_PAUSE;
         }
+        if (m.fd < 0 && (errno == ECONNABORTED || errno == EINTR))
+            continue; /* 받기 전에 손님이 떠났다 */
         if (m.fd < 0)
-            return errno != ENOBUFS && errno != ENOMEM;
+            return errno == ENOBUFS || errno == ENOMEM ? ACCEPT_PAUSE : ACCEPT_EMPTY;
         net_nodelay(m.fd);
         struct loop *l = pick_loop(s);
         atomic_fetch_add(&l->nconn, 1);
@@ -81,7 +89,7 @@ static bool accept_some(struct server *s, int lfd, int origin)
             close(m.fd);
         }
     }
-    return true;
+    return ACCEPT_MORE;
 }
 
 /* 연결 하나가 fd를 둘(클라이언트, 백엔드)까지 쓴다. 모자라면 한도를 올리고, 안 되면 상한을 줄인다 */
@@ -102,10 +110,11 @@ static void plan_fds(struct config *cfg)
     }
 }
 
-static void tell_loops(struct server *s, enum msg_type type)
+static void set_phase(struct server *s, enum phase p)
 {
+    atomic_store(&s->phase, p);
     for (int i = 0; i < s->nloops; i++)
-        loop_send(&s->loops[i], &(struct msg){.type = type});
+        loop_send(&s->loops[i], &(struct msg){.type = MSG_WAKE}); /* 쪽지함이 차서 실패해도, 그러면 이미 깨어 있다 */
 }
 
 /* listen 소켓 하나. 어느 문인지 같이 기억한다 */
@@ -153,7 +162,7 @@ static void run(struct server *s, struct config *cfg, int evfd, struct door *doo
         for (int i = 0; i < n; i++) {
             if (ev[i].io->kind == IO_LISTEN) {
                 struct door *d = (struct door *)ev[i].io;
-                if (signals == 0 && !accept_some(s, d->io.fd, d->origin))
+                if (signals == 0 && accept_some(s, d->io.fd, d->origin) == ACCEPT_PAUSE)
                     paused_until = now + 100;
             } else if (ev[i].io->kind == IO_HEALTH) {
                 health_event(ev[i].io, ev[i].ready, now);
@@ -163,17 +172,18 @@ static void run(struct server *s, struct config *cfg, int evfd, struct door *doo
         bool stop = read(g_sig_pipe[0], sig, sizeof sig) > 0;
         if (alive_fd >= 0 && read(alive_fd, sig, 1) == 0) { /* 감독이 죽었다. 혼자 남지 않는다 */
             alive_fd = -1;
-            stop = true;
+            stop = signals == 0; /* 이미 마무리 중이면 "두 번째 시그널"로 치지 않는다 */
         }
         if (stop) {
             if (signals++ == 0) {
-                fprintf(stderr, "종료 시작: 처리 중인 요청을 마칩니다\n");
+                log_note("종료 시작: 처리 중인 요청을 마칩니다");
                 for (int k = 0; k < ndoors; k++) {
-                    accept_some(s, doors[k].io.fd, doors[k].origin); /* 이미 handshake가 끝난 연결까지 받고 */
+                    while (accept_some(s, doors[k].io.fd, doors[k].origin) == ACCEPT_MORE)
+                        ; /* 이미 handshake가 끝난 연결까지 받고 */
                     ev_set(evfd, &doors[k].io, 0);
                     close(doors[k].io.fd); /* 문을 닫는다. 이제 새 연결은 커널이 거절한다 */
                 }
-                tell_loops(s, MSG_DRAIN);
+                set_phase(s, PHASE_DRAIN);
                 kill_at = now + cfg->drain_ms;
             } else {
                 kill_at = now; /* 두 번째 시그널: 기다리지 않는다 */
@@ -183,7 +193,7 @@ static void run(struct server *s, struct config *cfg, int evfd, struct door *doo
             ev_set(evfd, &doors[k].io, now < paused_until ? 0 : IO_R);
         if (kill_at && now >= kill_at) {
             kill_at = 0;
-            tell_loops(s, MSG_KILL);
+            set_phase(s, PHASE_KILL);
         }
         if (signals == 0)
             health_tick(now);
@@ -231,10 +241,13 @@ int main(int argc, char **argv)
     for (int k = 0; k < ndoors; k++) {
         if (!open_door(&doors[k], want[k], origins[k], in.n ? in.fd[k] : -1))
             return 1;
-        if (in.n && net_port(want[k]) != net_local_port(in.fd[k]))
-            fprintf(stderr, "포트 %d: 감독 프로세스를 다시 시작해야 바뀝니다\n", net_port(want[k]));
+        if (in.n && !net_is_bound_to(in.fd[k], want[k])) {
+            /* 소켓은 옛 주소 그대로인데 설정만 바뀐 채로 뜨면, 접근 제한을 새 주소 기준으로 잘못 판단한다 */
+            fprintf(stderr, "포트 %d: listen 주소를 바꾸려면 감독 프로세스를 다시 시작해야 합니다\n", net_port(want[k]));
+            return 2;
+        }
     }
-    if (cfg->has_forward && resolver_start(2) < 0)
+    if (cfg->has_forward && resolver_start(4) < 0)
         return 1;
 
     struct server s;
@@ -245,7 +258,18 @@ int main(int argc, char **argv)
     for (int i = 0; i < cfg->nroutes; i++)
         if (cfg->routes[i].cache && cfg->cache_size && !s.cache)
             s.cache = cache_new(cfg->cache_size);
-    snprintf(s.via, sizeof s.via, "jiho-webserver-%d", net_local_port(doors[0].io.fd));
+    s.forward_loopback = cfg->has_forward && net_is_loopback(&cfg->forward);
+    struct stat lst;
+    s.log_regular = s.log_fd >= 0 && fstat(s.log_fd, &lst) == 0 && S_ISREG(lst.st_mode);
+    /* 다른 컴퓨터의 같은 프로그램과 구별되도록 시작할 때마다 다른 이름 */
+    unsigned id = 0;
+    int rnd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (rnd < 0 || read(rnd, &id, sizeof id) != (ssize_t)sizeof id)
+        id = (unsigned)now_us() ^ (unsigned)getpid();
+    if (rnd >= 0)
+        close(rnd);
+    snprintf(s.via, sizeof s.via, "jiho-webserver-%08x", id);
+    snprintf(s.via_forward, sizeof s.via_forward, "jiho-webserver-%08x-forward", id);
     s.nloops = cfg->loops ? cfg->loops : (int)sysconf(_SC_NPROCESSORS_ONLN);
     s.loops = calloc((size_t)s.nloops, sizeof *s.loops);
     for (int i = 0; i < s.nloops; i++)
