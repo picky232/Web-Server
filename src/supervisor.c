@@ -222,8 +222,8 @@ static void on_child(struct sup *s)
             log_note("감독: 새 워커가 시작하지 못했습니다(%s %d).%s", how, code, s->current.pid ? " 옛 워커를 그대로 둡니다" : "");
             if (!s->ever_ready)
                 s->stopping = true; /* 첫 시작부터 실패: 설정이 잘못됐다 */
-            else if (!s->stopping)
-                schedule(s);
+            else if (!s->stopping && (!s->current.pid || s->misses >= MISS_LIMIT))
+                schedule(s); /* 멀쩡한 워커가 있으면 다시 시도하지 않는다. 다음 SIGHUP을 기다린다 */
         } else if (pid == s->current.pid) {
             drop_fd(&s->current);
             s->current = (struct worker){.fd = -1};
