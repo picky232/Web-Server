@@ -1,6 +1,7 @@
 #ifndef SERVER_H
 #define SERVER_H
 
+#include "cache.h"
 #include "config.h"
 #include "loop.h"
 
@@ -13,6 +14,7 @@ struct server {
     atomic_int loops_alive;
     atomic_int cgi_running;
     int log_fd; /* -1 = 끔 */
+    struct cache *cache; /* NULL = 끔 */
     long long started_ms;
     atomic_llong spool_bytes; /* 지금 임시 파일에 있는 요청 본문 바이트 */
 };

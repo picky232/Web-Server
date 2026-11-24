@@ -47,6 +47,8 @@ struct proxy_st {
     bool eof;
     bool reusable, bad_status;
     struct body_dec dec;
+    struct cached *saving; /* 응답을 중계하면서 같이 모으는 캐시 사본 */
+    size_t saving_cap;
     /* 포워드 프록시: 백엔드 묶음 대신 이름 해석 결과로 접속한다 */
     struct resolve *asking; /* 이름 해석을 기다리는 중 */
     struct addr addr[RESOLVE_MAX];
@@ -55,6 +57,7 @@ struct proxy_st {
 };
 
 extern const struct handler proxy_handler;
+extern const struct handler cache_handler; /* 저장해 둔 응답을 내보낸다 */
 
 bool upstream_is_loop(const struct conn *c);       /* Via에 내 이름이 있다 = 나에게 되돌아온 요청 */
 void upstream_connect_addrs(struct conn *c);      /* px->addr의 주소들에 차례로 접속 */

@@ -4,6 +4,7 @@
 #include "conn.h"
 #include "loop.h"
 #include "server.h"
+#include "static.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -140,12 +141,146 @@ bool upstream_request_head(const struct exchange *ex, const char *ip, const char
     return ok && buf_append(out, "\r\n", 2);
 }
 
-/* ---- 백엔드 고르기와 연결 ---- */
+/* ---- 캐시 ---- */
+
+#define CACHE_OBJECT_MAX (1 << 20)
 
 static struct proxy_st *px_of(struct conn *c)
 {
     return &c->ex->u.proxy;
 }
+
+static bool cache_on(const struct conn *c)
+{
+    return c->ex->route && c->ex->route->cache && c->loop->srv->cache;
+}
+
+/* "호스트 경로?쿼리". 같은 주소라도 호스트가 다르면 다른 응답이다 */
+static char *cache_key(const struct exchange *ex)
+{
+    size_t n = strlen(ex->host) + strlen(ex->path) + ex->target.query.n + 32;
+    char *k = malloc(n);
+    if (k)
+        snprintf(k, n, "%s:%d %s%.*s", ex->host, ex->port, ex->path, (int)ex->target.query.n,
+                 ex->target.query.n ? ex->target.query.p : "");
+    return k;
+}
+
+static void saving_drop(struct proxy_st *px)
+{
+    if (!px->saving)
+        return;
+    atomic_store(&px->saving->refs, 1);
+    cached_unref(px->saving);
+    px->saving = NULL;
+}
+
+/* 이 응답을 저장해도 되면 사본을 만들기 시작한다 */
+static void saving_begin(struct conn *c, const struct http_res *res, const struct buf *extra, unsigned flags)
+{
+    struct proxy_st *px = px_of(c);
+    long long age = 0, fresh = cache_on(c) ? cache_fresh_ms(&c->ex->req, res, &age) : 0;
+    if (!fresh || res->length > CACHE_OBJECT_MAX)
+        return;
+    struct cached *o = calloc(1, sizeof *o);
+    if (!o)
+        return;
+    px->saving = o;
+    px->saving_cap = 0;
+    o->key = cache_key(c->ex);
+    o->head = malloc(buf_len(extra) + 1);
+    if (!o->key || !o->head) {
+        saving_drop(px);
+        return;
+    }
+    /* Age는 꺼낼 때 새로 계산해서 붙이므로 저장하지 않는다 */
+    for (const char *p = buf_head(extra), *end = p + buf_len(extra); p < end;) {
+        const char *eol = (const char *)memchr(p, '\n', (size_t)(end - p)) + 1;
+        const char *colon = memchr(p, ':', (size_t)(eol - p));
+        struct sl name = {p, (size_t)(colon - p)};
+        if (!sl_eqi(name, "Age")) {
+            memcpy(o->head + o->head_n, p, (size_t)(eol - p));
+            o->head_n += (size_t)(eol - p);
+        }
+        p = eol;
+    }
+    const struct field *etag = fields_find(&res->h, "ETag");
+    if (etag)
+        sl_copy(etag->value, o->etag, sizeof o->etag);
+    o->flags = flags;
+    o->stored_ms = c->loop->now;
+    o->age_ms = age;
+    o->fresh_ms = fresh;
+}
+
+static void saving_add(struct proxy_st *px, struct sl data)
+{
+    struct cached *o = px->saving;
+    if (!o)
+        return;
+    if (o->body_n + data.n > CACHE_OBJECT_MAX) {
+        saving_drop(px);
+        return;
+    }
+    if (o->body_n + data.n > px->saving_cap) {
+        size_t cap = (o->body_n + data.n) * 2;
+        char *p = realloc(o->body, cap);
+        if (!p) {
+            saving_drop(px);
+            return;
+        }
+        o->body = p;
+        px->saving_cap = cap;
+    }
+    memcpy(o->body + o->body_n, data.p, data.n);
+    o->body_n += data.n;
+}
+
+static void cache_start(struct conn *c, struct cached *o)
+{
+    struct exchange *ex = c->ex;
+    ex->u.cache = (struct cache_st){.o = o};
+    ex->h = &cache_handler;
+    ex->deadline = 0;
+    snprintf(ex->served_by, sizeof ex->served_by, "cache");
+    const struct field *inm = fields_find(&ex->req.h, "If-None-Match");
+    bool same = inm && o->etag[0] && etag_matches(inm->value, o->etag);
+    struct buf extra;
+    buf_init(&extra, HTTP_HEAD_MAX * 2);
+    bool ok = buf_append(&extra, o->head, o->head_n) &&
+              buf_printf(&extra, "Age: %lld\r\nX-Cache: HIT\r\n", (c->loop->now - o->stored_ms + o->age_ms) / 1000) &&
+              reply_start(&ex->reply, &c->out, same ? 304 : 200, (long long)o->body_n, buf_head(&extra), buf_len(&extra),
+                          o->flags);
+    buf_free(&extra);
+    if (!ok)
+        exchange_abort(c);
+}
+
+static bool cache_pump(struct conn *c)
+{
+    struct cache_st *s = &c->ex->u.cache;
+    size_t n = reply_room(&c->ex->reply, &c->out), left = s->o->body_n - s->off;
+    if (c->ex->reply.framing == FRAME_NONE)
+        left = 0;
+    if (left == 0) {
+        exchange_finish(c);
+        return true;
+    }
+    if (n > left)
+        n = left;
+    reply_write(&c->ex->reply, &c->out, s->o->body + s->off, n);
+    s->off += n;
+    return n > 0;
+}
+
+static void cache_stop(struct conn *c)
+{
+    cached_unref(c->ex->u.cache.o);
+}
+
+const struct handler cache_handler = {.name = "cache", .pump = cache_pump, .stop = cache_stop};
+
+/* ---- 백엔드 고르기와 연결 ---- */
 
 /* 요청을 다시 보내도 두 번 처리될 위험이 없는가 */
 static bool retry_safe(const struct exchange *ex)
@@ -300,6 +435,15 @@ static void proxy_start(struct conn *c)
         exchange_error(c, 508, NULL);
         return;
     }
+    if (cache_on(c)) {
+        char *key = cache_key(ex);
+        struct cached *o = key && cache_may_lookup(&ex->req) ? cache_get(c->loop->srv->cache, key, c->loop->now) : NULL;
+        free(key);
+        if (o) {
+            cache_start(c, o);
+            return;
+        }
+    }
     px->pool = ex->route->pool;
     px->give_up = c->loop->now + 3LL * c->loop->srv->cfg->connect_ms;
     px->fail_status = 503; /* 하나도 못 골랐다 = 모두 한도까지 찼다 */
@@ -424,8 +568,19 @@ static bool start_reply(struct conn *c, const struct http_res *res)
     struct buf extra;
     buf_init(&extra, HTTP_HEAD_MAX * 2);
     unsigned flags = 0;
-    bool ok = copy_headers(res, &extra, &flags) &&
-              (px->pool || buf_printf(&extra, "Via: 1.1 %s\r\n", c->loop->srv->via)) && /* 포워드 프록시의 의무 */
+    bool ok = copy_headers(res, &extra, &flags);
+    if (ok)
+        saving_begin(c, res, &extra, flags);
+    if (ok && cache_on(c)) {
+        ok = buf_printf(&extra, "X-Cache: MISS\r\n");
+        /* 값을 바꾸는 요청이 성공했으면 저장해 둔 것은 낡았다 */
+        enum http_method m = ex->req.method;
+        char *key = m != M_GET && m != M_HEAD && m != M_OPTIONS && res->status < 400 ? cache_key(ex) : NULL;
+        if (key)
+            cache_remove(c->loop->srv->cache, key);
+        free(key);
+    }
+    ok = ok && (px->pool || buf_printf(&extra, "Via: 1.1 %s\r\n", c->loop->srv->via)) && /* 포워드 프록시의 의무 */
               reply_start(&ex->reply, &c->out, res->status, res->length, buf_head(&extra), buf_len(&extra), flags);
     buf_free(&extra);
     if (!ok)
@@ -501,8 +656,13 @@ static bool relay_body(struct conn *c)
             return true;
         }
         reply_write(&ex->reply, &c->out, data.p, data.n);
+        saving_add(px, data);
         buf_consume(in, (size_t)used);
         moved = true;
+    }
+    if (px->saving && px->dec.done) { /* 끝까지 온전히 받은 것만 저장한다 */
+        cache_put(c->loop->srv->cache, px->saving);
+        px->saving = NULL;
     }
     if (px->dec.done || (px->eof && px->dec.kind == BODY_EOF)) {
         bool sent_all = !px->send_broken && !buf_len(&px->up->out) && px->body_off == ex->body.size;
@@ -609,6 +769,7 @@ static void proxy_timeout(struct conn *c)
 
 static void proxy_stop(struct conn *c)
 {
+    saving_drop(px_of(c));
     release(c, OUT_NEUTRAL, false);
 }
 

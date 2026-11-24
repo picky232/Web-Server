@@ -805,6 +805,90 @@ class Forward(ProxyCase):
         time.sleep(0.5)
         self.assertEqual(s.get("/")[0], 200)
 
+# ---- 캐시 ----
+
+class Cache(ProxyCase):
+    def start(self, extra=b"Cache-Control: max-age=60\r\n", body=b"v%d", pool=""):
+        self.n = 0
+
+        def script(sock, head, b):
+            self.n += 1
+            data = (body % self.n) if b"%d" in body else body
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n" % len(data) + extra + b"\r\n" + data)
+        return self.up(script, route="route * / proxy p cache\n", pool=pool)
+
+    def test_hit_miss_and_age(self):
+        s = self.start(b'Cache-Control: max-age=60\r\nAge: 5\r\nETag: "e"\r\n')
+        st, h, body, _ = s.get("/a?x")
+        self.assertEqual((h["x-cache"], body), ("MISS", b"v1"))
+        st, h, body, _ = s.get("/a?x")
+        self.assertEqual((h["x-cache"], h["age"], body), ("HIT", "5", b"v1"))
+        st, h, body, _ = s.get("/a?x", method="HEAD")
+        self.assertEqual((h["x-cache"], h["content-length"], body), ("HIT", "2", b""))
+        st, h, body, _ = s.get("/a?x", headers=[("If-None-Match", '"e"')])
+        self.assertEqual((st, body), (304, b""))
+        self.assertEqual(s.get("/a?y")[1]["x-cache"], "MISS")           # 쿼리가 다르면 다른 것
+        self.assertEqual(s.get("/a?x", host="other")[1]["x-cache"], "MISS")  # 호스트가 다르면 다른 것
+        for h in (("Cookie", "a=b"), ("Authorization", "x"), ("Cache-Control", "no-cache"), ("Range", "bytes=0-0")):
+            self.assertEqual(s.get("/a?x", headers=[h])[1]["x-cache"], "MISS", h)
+        self.assertEqual(s.get("/a?x", method="POST", body=b"z")[0], 200)  # 값을 바꾸는 요청이 성공하면 지운다
+        self.assertEqual(s.get("/a?x")[1]["x-cache"], "MISS")
+
+    def test_private_responses_are_never_stored(self):
+        for extra in (b"", b"Cache-Control: private, max-age=60\r\n", b"Cache-Control: max-age=60\r\nSet-Cookie: s=1\r\n",
+                      b"Cache-Control: max-age=60\r\nVary: Cookie\r\n", b"Cache-Control: no-store\r\n"):
+            s = self.start(extra)
+            self.assertEqual([s.get("/")[2] for _ in range(3)], [b"v1", b"v2", b"v3"], extra)
+            self.tearDown()
+            del self.s
+
+    def test_expires(self):
+        s = self.start(b"Cache-Control: max-age=1\r\n")
+        self.assertEqual([s.get("/")[2] for _ in range(3)], [b"v1"] * 3)
+        time.sleep(1.1)
+        self.assertEqual(s.get("/")[2], b"v2")
+
+    def test_truncated_and_big_are_not_stored(self):
+        self.n = 0
+
+        def script(sock, head, b):
+            self.n += 1
+            if b"/cut" in head:
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nCache-Control: max-age=60\r\n\r\nabc")
+                return False
+            data = b"x" * 2_000_000
+            sock.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nCache-Control: max-age=60\r\n\r\n%x\r\n" % len(data) + data + b"\r\n0\r\n\r\n")
+        s = self.up(script, route="route * / proxy p cache\n")
+        for path, size in (("/cut", None), ("/big", 2_000_000)):
+            self.n = 0
+            for _ in range(2):
+                out, _ = s.raw(f"GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+                self.assertIn(b"X-Cache: MISS", out)
+                if size:
+                    self.assertEqual(len(parse(out)[2]), size)
+            self.assertEqual(self.n, 2)
+
+    def test_many_readers_and_writers(self):
+        s = self.start(b"Cache-Control: max-age=60\r\n", b"z" * 300_000)
+        bad = []
+
+        def one(i):
+            for k in range(30):
+                if i % 4 == 0 and k % 3 == 0:
+                    s.get(f"/{k % 5}", method="POST", body=b"x")
+                elif s.get(f"/{k % 5}", timeout=20)[2] != b"z" * 300_000:
+                    bad.append((i, k))
+        ts = [threading.Thread(target=one, args=(i,)) for i in range(16)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(bad, [])
+
+    def test_survives_dead_backend(self):
+        s = self.start()
+        s.get("/a")
+        self.b[0].stop()
+        self.assertEqual((s.get("/a")[0], s.get("/b")[0]), (200, 502))
+
 
 # ---- CGI, 상태 페이지, 로그 ----
 

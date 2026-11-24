@@ -34,5 +34,6 @@ void test_spool(void);
 void test_config(void);
 void test_balance(void);
 void test_cgi(void);
+void test_cache(void);
 
 #endif

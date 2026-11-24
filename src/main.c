@@ -217,6 +217,9 @@ int main(int argc, char **argv)
     s.cfg = cfg;
     s.started_ms = now_ms();
     s.log_fd = open_log(cfg);
+    for (int i = 0; i < cfg->nroutes; i++)
+        if (cfg->routes[i].cache && cfg->cache_size && !s.cache)
+            s.cache = cache_new(cfg->cache_size);
     snprintf(s.via, sizeof s.via, "jiho-webserver-%d", net_local_port(doors[0].io.fd));
     s.nloops = cfg->loops ? cfg->loops : (int)sysconf(_SC_NPROCESSORS_ONLN);
     s.loops = calloc((size_t)s.nloops, sizeof *s.loops);
@@ -242,6 +245,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < s.nloops; i++)
         loop_join(&s.loops[i]);
     free(s.loops);
+    cache_free(s.cache);
     close(evfd);
     close(g_spare_fd);
     if (s.log_fd > 2)

@@ -16,7 +16,8 @@ static const char page[] =
     "<script>const row=(t,a,c)=>{const r=t.insertRow();a.forEach((v,i)=>{const d=r.appendChild(document.createElement(c||'td'));"
     "d.textContent=v;if(v==='up'||v==='down'||v==='ejected')d.className=v})};"
     "async function go(){try{const s=await(await fetch('status.json')).json();"
-    "top_.textContent=`가동 ${s.uptime_s}초 · 요청 ${s.requests} · CGI ${s.cgi_running} · 업로드 임시 파일 ${s.upload_disk_bytes}B`;"
+    "top_.textContent=`가동 ${s.uptime_s}초 · 요청 ${s.requests} · CGI ${s.cgi_running} · 업로드 임시 파일 ${s.upload_disk_bytes}B`"
+    "+(s.cache?` · 캐시 적중 ${s.cache.hits} / 실패 ${s.cache.misses}`:'');"
     "be.innerHTML='';row(be,['묶음','백엔드','상태','처리 중','요청','실패','연결 재사용'],'th');"
     "s.pools.forEach(p=>p.backends.forEach(b=>row(be,[p.name+' ('+p.policy+')',b.name,b.state,b.inflight,b.requests,b.failures,b.reused])));"
     "lo.innerHTML='';row(lo,['루프','연결','받은 연결','요청','가장 오래 붙잡힌 시간(ms)'],'th');"
@@ -36,8 +37,14 @@ static bool build_json(struct server *s, long long now, struct buf *o)
     long long requests = 0;
     for (int i = 0; i < s->nloops; i++)
         requests += atomic_load(&s->loops[i].requests);
-    bool ok = buf_printf(o, "{\"uptime_s\":%lld,\"requests\":%lld,\"cgi_running\":%d,\"upload_disk_bytes\":%lld,\"pools\":[",
+    bool ok = buf_printf(o, "{\"uptime_s\":%lld,\"requests\":%lld,\"cgi_running\":%d,\"upload_disk_bytes\":%lld,",
                          (now - s->started_ms) / 1000, requests, atomic_load(&s->cgi_running), atomic_load(&s->spool_bytes));
+    if (ok && s->cache) {
+        long long hits, misses, bytes, count;
+        cache_stats(s->cache, &hits, &misses, &bytes, &count);
+        ok = buf_printf(o, "\"cache\":{\"hits\":%lld,\"misses\":%lld,\"bytes\":%lld,\"objects\":%lld},", hits, misses, bytes, count);
+    }
+    ok = ok && buf_printf(o, "\"pools\":[");
     for (int i = 0; ok && i < s->cfg->npools; i++) {
         const struct pool *p = &s->cfg->pools[i];
         ok = buf_printf(o, "%s{\"name\":\"%s\",\"policy\":\"%s\",\"max\":%d,\"backends\":[", i ? "," : "", p->name,

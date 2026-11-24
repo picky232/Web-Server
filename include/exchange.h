@@ -9,6 +9,12 @@
 #include "upstream.h"
 #include "uri.h"
 
+struct cached;
+struct cache_st {
+    struct cached *o;
+    size_t off;
+};
+
 struct static_st {
     int fd;
     long long off, left;
@@ -51,6 +57,7 @@ struct exchange {
         struct static_st file;
         struct proxy_st proxy;
         struct cgi_st cgi;
+        struct cache_st cache;
     } u; /* 핸들러별 상태 */
 };
 
