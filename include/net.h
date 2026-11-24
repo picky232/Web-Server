@@ -1,24 +1,30 @@
 #ifndef NET_H
 #define NET_H
 
+#include <stdbool.h>
 #include <stddef.h>
+#include <sys/socket.h>
 
-/* socket → setsockopt(SO_REUSEADDR) → bind → listen. 실제로 열린 포트를 *actual_port에 적는다 */
-int net_listen(const char *addr, int port, int *actual_port);
+struct addr {
+    struct sockaddr_storage ss;
+    socklen_t len;
+};
 
-/* fd가 읽기/쓰기 가능해질 때까지 최대 timeout_ms 기다린다. 1 = 준비됨, 0 = 시간 초과, -1 = 에러 */
-int net_wait(int fd, short events, int timeout_ms);
+/* "127.0.0.1:8080", "[::1]:8080", "localhost:8080" → 주소. DNS를 쓸 수 있으므로 시작할 때만 부른다 */
+bool net_parse_addr(const char *s, struct addr *out);
+bool net_parse_hostport(const char *host, const char *port, bool numeric, struct addr *out);
 
-/* 백엔드에 연결한다. timeout_ms 안에 안 되면 -1 (errno = ETIMEDOUT), 거절되면 -1 (ECONNREFUSED 등) */
-int net_connect(const char *host, const char *port, int timeout_ms);
+int net_listen(const struct addr *a);                 /* socket → SO_REUSEADDR → bind → listen */
+int net_accept(int lfd, struct addr *peer);           /* 안 기다리는 소켓으로 돌려준다 */
+int net_connect(const struct addr *a);                /* 연결을 시작만 한다. 결과는 쓰기 준비 이벤트 뒤 net_error */
+int net_error(int fd);                                /* 연결 결과. 0 = 성공, 그 외 errno */
+int net_pipe(int p[2]);                               /* 안 기다리는 파이프 */
+int net_nonblock(int fd);                             /* O_NONBLOCK + FD_CLOEXEC */
+void net_nodelay(int fd);
 
-/* n바이트를 전부 쓸 때까지 send를 반복한다. 0 = 성공, -1 = 연결이 끊김/시간 초과 */
-int net_send_all(int fd, const void *buf, size_t n);
-
-/* 응답을 다 쓴 뒤 닫기: 쓰기 방향만 먼저 닫고, 클라이언트가 보낸 남은 바이트를 잠깐 버린 뒤 close */
-void net_close_lingering(int fd);
-
-/* 단조 증가 시계 (밀리초). 제한 시간 계산용 */
-long long net_now_ms(void);
+void net_ip(const struct addr *a, char *out, size_t cap);
+int net_port(const struct addr *a);
+int net_local_port(int fd);
+bool net_is_loopback(const struct addr *a);
 
 #endif

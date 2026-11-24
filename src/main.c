@@ -1,81 +1,112 @@
-#include "config.h"
-#include "conn.h"
 #include "net.h"
-#include "response.h"
-#include "static.h"
-#include "threadpool.h"
+#include "server.h"
+#include "str.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
-volatile sig_atomic_t g_stop;
+static int g_sig_pipe[2];
 
+/* 시그널 처리 함수 안에서는 할 수 있는 일이 거의 없다. 파이프에 번호 한 바이트만 쓰고 나온다 */
 static void on_signal(int sig)
 {
-    (void)sig;
-    g_stop = 1; /* 핸들러에서는 깃발만 세운다. 정리는 메인 루프가 한다 */
+    int e = errno;
+    unsigned char b = (unsigned char)sig;
+    (void)!write(g_sig_pipe[1], &b, 1);
+    errno = e;
 }
 
-int main(int argc, char **argv)
+static void setup_signals(void)
 {
-    int rc = config_parse(argc, argv);
-    if (rc != 0)
-        return rc > 0 ? 0 : 2;
-    if (static_init(g_cfg.root) < 0)
-        return 2;
-
-    /* 끊긴 연결에 write하면 SIGPIPE로 프로세스가 죽는다. 무시하고 EPIPE 에러로 받는다 */
-    signal(SIGPIPE, SIG_IGN);
+    if (net_pipe(g_sig_pipe) < 0) {
+        perror("pipe");
+        exit(1);
+    }
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sa.sa_handler = SIG_IGN; /* 끊긴 연결에 쓰면 프로세스가 죽는 대신 EPIPE를 받는다 */
+    sigaction(SIGPIPE, &sa, NULL);
+}
 
-    int port;
-    int listenfd = net_listen(g_cfg.bind_addr, g_cfg.port, &port);
-    if (listenfd < 0)
-        return 1;
-    if (pool_start(g_cfg.threads, g_cfg.queue, conn_handle) < 0)
-        return 1;
-    fprintf(stderr, "listening on http://%s:%d\n", g_cfg.bind_addr, port);
+/* 연결이 가장 적은 루프 */
+static struct loop *pick_loop(struct server *s)
+{
+    struct loop *best = &s->loops[0];
+    for (int i = 1; i < s->nloops; i++)
+        if (atomic_load(&s->loops[i].nconn) < atomic_load(&best->nconn))
+            best = &s->loops[i];
+    return best;
+}
 
-    while (!g_stop) {
-        /* accept에서 계속 멈춰 있으면 Ctrl+C를 늦게 알아챈다. 0.2초마다 깃발을 확인한다 */
-        if (net_wait(listenfd, POLLIN, 200) <= 0)
-            continue;
-        struct sockaddr_in peer;
-        socklen_t plen = sizeof peer;
-        int connfd = accept(listenfd, (struct sockaddr *)&peer, &plen);
-        if (connfd < 0)
-            continue;
-        /* 응답을 읽지 않는 클라이언트 때문에 send가 영원히 멈추지 않게 한다 */
-        struct timeval tv = {.tv_sec = g_cfg.read_timeout_ms / 1000,
-                             .tv_usec = (g_cfg.read_timeout_ms % 1000) * 1000};
-        setsockopt(connfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-        /* 헤더와 본문을 따로 send하면 Nagle + 지연 ACK가 겹쳐 응답마다 수십 ms 멈출 수 있다 */
-        int one = 1;
-        setsockopt(connfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        char ip[INET_ADDRSTRLEN] = "?";
-        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
-        /* 메인 스레드는 받아서 큐에 넣기만 한다. 실제 처리는 작업 스레드 몫 */
-        if (pool_submit(connfd, ip) < 0) {
-            send_error(connfd, 503, 0, "Retry-After: 1\r\n", 0); /* 큐가 가득 참: 잠시 뒤 다시 */
-            shutdown(connfd, SHUT_WR);
-            close(connfd);
+static void accept_some(struct server *s, int lfd, int origin)
+{
+    for (int i = 0; i < 64; i++) { /* 한 번에 64개까지. 나머지는 다음 바퀴에 다시 알려 준다 */
+        struct msg m = {.type = MSG_CONN, .origin = origin};
+        m.fd = net_accept(lfd, &m.peer);
+        if (m.fd < 0)
+            return;
+        net_nodelay(m.fd);
+        struct loop *l = pick_loop(s);
+        atomic_fetch_add(&l->nconn, 1);
+        if (!loop_send(l, &m)) {
+            atomic_fetch_sub(&l->nconn, 1);
+            close(m.fd);
         }
     }
+}
 
-    close(listenfd); /* 이제 새 연결은 거절된다 */
-    pool_stop();     /* 처리 중인 요청은 끝까지 마치고 스레드를 거둔다 */
+int main(int argc, char **argv)
+{
+    const char *where = argc > 1 ? argv[1] : "127.0.0.1:8080";
+    struct addr a;
+    if (!net_parse_addr(where, &a)) {
+        fprintf(stderr, "주소를 읽을 수 없습니다: %s\n", where);
+        return 2;
+    }
+    setup_signals();
+    int lfd = net_listen(&a);
+    if (lfd < 0) {
+        fprintf(stderr, "%s: listen 실패: %s\n", where, strerror(errno));
+        return 1;
+    }
+    struct server s;
+    memset(&s, 0, sizeof s);
+    s.nloops = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    s.loops = calloc((size_t)s.nloops, sizeof *s.loops);
+    for (int i = 0; i < s.nloops; i++)
+        if (!s.loops || loop_start(&s.loops[i], i, &s) < 0) {
+            perror("loop_start");
+            return 1;
+        }
+    fprintf(stderr, "listening on %s (port %d, loops %d)\n", where, net_local_port(lfd), s.nloops);
+
+    int evfd = ev_open();
+    struct io sig_io = {.fd = g_sig_pipe[0], .kind = IO_PIPE}, lis_io = {.fd = lfd, .kind = IO_LISTEN};
+    ev_set(evfd, &sig_io, IO_R);
+    ev_set(evfd, &lis_io, IO_R);
+    for (bool stop = false; !stop;) {
+        struct ev_event ev[16];
+        int n = ev_wait(evfd, ev, 16, -1);
+        for (int i = 0; i < n; i++) {
+            if (ev[i].io == &lis_io)
+                accept_some(&s, lfd, ORIGIN_WEB);
+            else
+                stop = true;
+        }
+    }
+    close(lfd);
+    for (int i = 0; i < s.nloops; i++)
+        loop_send(&s.loops[i], &(struct msg){.type = MSG_DRAIN});
+    for (int i = 0; i < s.nloops; i++)
+        loop_join(&s.loops[i]);
+    free(s.loops);
     fprintf(stderr, "shutdown complete\n");
     return 0;
 }

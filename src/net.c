@@ -5,144 +5,158 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <poll.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
-int net_listen(const char *addr, int port, int *actual_port)
+int net_nonblock(int fd)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
+    int fl = fcntl(fd, F_GETFL);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0)
         return -1;
-    }
-    /* 재시작할 때 TIME_WAIT 상태의 옛 연결이 포트를 잡고 있어도 bind 되게 한다 */
+    return fcntl(fd, F_SETFD, FD_CLOEXEC); /* CGI 자식 프로세스가 우리 소켓을 물려받지 않게 */
+}
+
+void net_nodelay(int fd)
+{
     int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((unsigned short)port);
-    if (inet_pton(AF_INET, addr, &sa.sin_addr) != 1) {
-        fprintf(stderr, "잘못된 주소: %s\n", addr);
-        close(fd);
-        return -1;
-    }
-    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
-        perror("bind");
-        close(fd);
-        return -1;
-    }
-    /* 이 순간부터 커널이 3-way handshake를 대신 처리하고 accept 큐에 쌓는다 */
-    if (listen(fd, 128) < 0) {
-        perror("listen");
-        close(fd);
-        return -1;
-    }
-    socklen_t len = sizeof sa;
-    getsockname(fd, (struct sockaddr *)&sa, &len); /* --port 0 이면 커널이 고른 포트 */
-    *actual_port = ntohs(sa.sin_port);
-    return fd;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 }
 
-int net_wait(int fd, short events, int timeout_ms)
-{
-    long long deadline = net_now_ms() + timeout_ms;
-    for (;;) {
-        struct pollfd p = {.fd = fd, .events = events};
-        int r = poll(&p, 1, timeout_ms);
-        if (r >= 0)
-            return r;
-        if (errno != EINTR)
-            return -1;
-        /* 시그널(Ctrl+C 등)에 깨어난 것뿐이면 남은 시간만큼 다시 기다린다 */
-        timeout_ms = (int)(deadline - net_now_ms());
-        if (timeout_ms <= 0)
-            return 0;
-    }
-}
-
-int net_connect(const char *host, const char *port, int timeout_ms)
+bool net_parse_hostport(const char *host, const char *port, bool numeric, struct addr *out)
 {
     struct addrinfo hints, *res;
     memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, port, &hints, &res) != 0) {
-        errno = EHOSTUNREACH;
-        return -1;
-    }
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    int err = fd < 0 ? errno : 0;
-    if (fd >= 0) {
-        /* 그냥 connect하면 응답 없는 상대에게 수십 초 멈춘다. non-blocking으로 걸고 poll로 기다린다 */
-        int flags = fcntl(fd, F_GETFL);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-            err = errno;
-            if (err == EINPROGRESS) {
-                socklen_t elen = sizeof err;
-                int w = net_wait(fd, POLLOUT, timeout_ms);
-                if (w == 0)
-                    err = ETIMEDOUT;
-                else if (w < 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0)
-                    err = errno;
-            }
-        }
-        fcntl(fd, F_SETFL, flags); /* 연결된 뒤에는 다시 blocking */
-    }
+    hints.ai_flags = AI_NUMERICSERV | (numeric ? AI_NUMERICHOST : 0);
+    if (getaddrinfo(host, port, &hints, &res) != 0)
+        return false;
+    memset(out, 0, sizeof *out);
+    memcpy(&out->ss, res->ai_addr, res->ai_addrlen);
+    out->len = res->ai_addrlen;
     freeaddrinfo(res);
-    if (err) {
-        if (fd >= 0)
-            close(fd);
-        errno = err;
+    return true;
+}
+
+bool net_parse_addr(const char *s, struct addr *out)
+{
+    char host[256];
+    const char *colon = strrchr(s, ':');
+    if (!colon || colon == s || !colon[1])
+        return false;
+    size_t n = (size_t)(colon - s);
+    if (s[0] == '[' && s[n - 1] == ']') { /* IPv6는 [::1]:8080 */
+        s++;
+        n -= 2;
+    }
+    if (n == 0 || n >= sizeof host)
+        return false;
+    memcpy(host, s, n);
+    host[n] = '\0';
+    return net_parse_hostport(host, colon + 1, false, out);
+}
+
+int net_listen(const struct addr *a)
+{
+    int fd = socket(a->ss.ss_family, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    /* 방금 닫은 연결이 TIME_WAIT로 남아 있어도 다시 bind할 수 있게 한다.
+       없으면 서버를 재시작할 때 "Address already in use"로 실패한다 */
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (net_nonblock(fd) < 0 || bind(fd, (const struct sockaddr *)&a->ss, a->len) < 0 ||
+        /* 이 순간부터 handshake는 커널이 혼자 끝내고, 완성된 연결을 대기열에 쌓아 둔다 */
+        listen(fd, 1024) < 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
         return -1;
     }
     return fd;
 }
 
-int net_send_all(int fd, const void *buf, size_t n)
+int net_accept(int lfd, struct addr *peer)
 {
-    const char *p = buf;
-    while (n > 0) {
-        /* send는 요청보다 적게 쓰고 돌아올 수 있다 (짧은 쓰기). 남은 만큼 다시 보낸다 */
-        ssize_t w = send(fd, p, n, 0);
-        if (w < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1; /* EPIPE·ECONNRESET(끊김) 또는 EAGAIN(SO_SNDTIMEO 시간 초과) */
-        }
-        p += w;
-        n -= (size_t)w;
+    peer->len = sizeof peer->ss;
+#ifdef __linux__
+    return accept4(lfd, (struct sockaddr *)&peer->ss, &peer->len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+#else
+    int fd = accept(lfd, (struct sockaddr *)&peer->ss, &peer->len);
+    if (fd >= 0 && net_nonblock(fd) < 0) {
+        close(fd);
+        errno = ECONNABORTED;
+        return -1;
+    }
+    return fd;
+#endif
+}
+
+int net_connect(const struct addr *a)
+{
+#ifdef __linux__
+    int fd = socket(a->ss.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+#else
+    int fd = socket(a->ss.ss_family, SOCK_STREAM, 0);
+#endif
+    if (fd < 0)
+        return -1;
+    if (net_nonblock(fd) < 0 ||
+        (connect(fd, (const struct sockaddr *)&a->ss, a->len) < 0 && errno != EINPROGRESS)) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    net_nodelay(fd);
+    return fd;
+}
+
+int net_error(int fd)
+{
+    int err = 0;
+    socklen_t len = sizeof err;
+    return getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 ? errno : err;
+}
+
+int net_pipe(int p[2])
+{
+    if (pipe(p) < 0)
+        return -1;
+    if (net_nonblock(p[0]) < 0 || net_nonblock(p[1]) < 0) {
+        close(p[0]);
+        close(p[1]);
+        return -1;
     }
     return 0;
 }
 
-void net_close_lingering(int fd)
+void net_ip(const struct addr *a, char *out, size_t cap)
 {
-    /* 읽지 않은 데이터가 남은 채로 close하면 커널이 FIN 대신 RST를 보내서
-       클라이언트가 방금 보낸 응답을 못 읽을 수 있다. 그래서 FIN을 먼저 보내고 잠깐 비운다 */
-    shutdown(fd, SHUT_WR);
-    char junk[4096];
-    long long end = net_now_ms() + 1000;
-    for (;;) {
-        long long left = end - net_now_ms();
-        if (left <= 0 || net_wait(fd, POLLIN, (int)left) <= 0)
-            break;
-        ssize_t r = recv(fd, junk, sizeof junk, 0);
-        if (r <= 0)
-            break;
-    }
-    close(fd);
+    const void *src = a->ss.ss_family == AF_INET6
+        ? (const void *)&((const struct sockaddr_in6 *)&a->ss)->sin6_addr
+        : (const void *)&((const struct sockaddr_in *)&a->ss)->sin_addr;
+    if (!inet_ntop(a->ss.ss_family, src, out, (socklen_t)cap))
+        snprintf(out, cap, "?");
 }
 
-long long net_now_ms(void)
+int net_port(const struct addr *a)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return ntohs(a->ss.ss_family == AF_INET6 ? ((const struct sockaddr_in6 *)&a->ss)->sin6_port
+                                             : ((const struct sockaddr_in *)&a->ss)->sin_port);
+}
+
+int net_local_port(int fd)
+{
+    struct addr a = {.len = sizeof a.ss};
+    return getsockname(fd, (struct sockaddr *)&a.ss, &a.len) < 0 ? 0 : net_port(&a);
+}
+
+bool net_is_loopback(const struct addr *a)
+{
+    if (a->ss.ss_family == AF_INET6)
+        return IN6_IS_ADDR_LOOPBACK(&((const struct sockaddr_in6 *)&a->ss)->sin6_addr);
+    return (ntohl(((const struct sockaddr_in *)&a->ss)->sin_addr.s_addr) >> 24) == 127;
 }
