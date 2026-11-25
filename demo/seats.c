@@ -1,31 +1,36 @@
 /* 좌석 예매 데모 백엔드. 서버 본체에 이 처리기 하나만 끼워 build/seats를 만든다 (make demo).
 
-     GET  /api/show    공연 정보 (프록시가 캐시해도 되는 유일한 응답)
-     GET  /api/seats   지금 좌석판
-     GET  /api/events  끝나지 않는 응답. 좌석판이 바뀔 때마다 서버가 먼저 보낸다
-     POST /api/book    seat=12&who=1a2b   (who: 손님이 스스로 정한 번호표)
+     GET  /api/show     공연 정보 (프록시가 캐시해도 되는 유일한 응답). POST하면 사본이 지워진다
+     GET  /api/seats    지금 좌석판
+     GET  /api/events   끝나지 않는 응답. 좌석판이 바뀔 때마다 서버가 먼저 보낸다
+     POST /api/book     seat=12&who=1a2b   (who: 손님이 스스로 정한 번호표)
+     POST /api/reset    좌석 비우기
+     GET·POST /api/work, /rr/work, /lc/work   누가 답했는지만 말하는 빈 일. 앞단이 경로마다 다른 묶음으로 보낸다
+     POST /fault/9001   mode=slow   10초 동안 고장 난 척 (slow hang busy drop die ok)
 
    좌석은 파일을 mmap한 메모리에 있다. 그래서 백엔드 여러 개가 같은 좌석판을 보고, 죽었다 다시 떠도 남아 있다 */
 #include "app.h"
-#include "conn.h"
+#include "demo.h"
 #include "loop.h"
 #include "server.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
-#define SEATS 60
 #define FILE_SIZE (SEATS * sizeof(atomic_ullong))
 #define PAY_MS 250   /* 결제를 흉내 내는 시간. 루프가 제한 시간을 0.25~0.5초마다 보므로 더 잘게는 못 잰다 */
 #define BEAT_MS 2000 /* 조용할 때 보내는 빈 신호. 없으면 프록시가 30초 뒤 끊고(timeout_stall), 손님이 떠난 것도 모른다 */
-#define NO_STORE "Cache-Control: no-store\r\n"
+#define FAULT_MS 10000 /* 고장은 저절로 풀린다. 켜 둔 것을 잊어도 화면이 망가진 채 남지 않게 */
+#define SLOW_MS 1500   /* 앞단의 timeout_response(3초)보다 짧아야 "느림"이지 "멈춤"이 아니다 */
 
 /* 잠금으로 흉내 낸 atomic은 그 잠금이 프로세스마다 따로라서, 다른 프로세스와 함께 쓸 수 없다 */
 _Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "64비트 atomic에 잠금이 필요한 기계에서는 쓸 수 없다");
@@ -39,7 +44,7 @@ struct seat_st {
     bool push;
     bool again; /* 이미 이 손님의 자리였다 */
     int seat;
-    unsigned long long who;
+    unsigned long long who; /* 번호표 */
     char board[SEATS + 1]; /* 이 손님에게 마지막으로 보낸 좌석판 */
     long long next_beat;
 };
@@ -84,14 +89,56 @@ static void read_board(unsigned long long who, char out[SEATS + 1])
     out[SEATS] = '\0';
 }
 
-static void json(struct conn *c, int status, const char *body, const char *extra)
+/* ---- 고장 내기 ---- */
+
+enum fault { FT_OK, FT_SLOW, FT_HANG, FT_BUSY, FT_DROP, FT_DIE, FT_N };
+static const char *const g_fault_name[FT_N] = {"ok", "slow", "hang", "busy", "drop", "die"};
+static atomic_int g_fault;
+static atomic_llong g_until; /* 이 시각까지 */
+
+static enum fault fault_now(const struct conn *c)
 {
-    struct exchange *ex = c->ex;
-    if (reply_text(&ex->reply, &c->out, status, "application/json", body, strlen(body), extra))
-        exchange_finish(c);
-    else
-        exchange_error(c, 500, NULL);
+    return c->loop->now < atomic_load(&g_until) ? (enum fault)atomic_load(&g_fault) : FT_OK;
 }
+
+/* 앞단은 어느 백엔드로 보낼지 스스로 고르므로, 포트를 짚어 말할 수 있게 경로마다 백엔드 하나짜리 묶음을 둔다 */
+static void control(struct conn *c)
+{
+    char mine[24], body[24], out[64];
+    snprintf(mine, sizeof mine, "/fault/%d", my_port(c));
+    bool post = c->ex->req.method == M_POST;
+    if (strcmp(c->ex->path, mine)) {
+        exchange_error(c, 404, NULL);
+        return;
+    }
+    if (!post && c->ex->req.method != M_GET) {
+        exchange_error(c, 405, "Allow: GET, POST\r\n");
+        return;
+    }
+    if (post && !from_page(c)) {
+        json(c, 403, "{\"error\":\"데모 화면에서 온 요청이 아닙니다\"}", NO_STORE);
+        return;
+    }
+    if (post) {
+        int f = FT_N;
+        if (body_text(c, body, sizeof body) && !strncmp(body, "mode=", 5))
+            for (f = 0; f < FT_N && strcmp(body + 5, g_fault_name[f]); f++) {
+            }
+        if (f == FT_N) {
+            json(c, 400, "{\"error\":\"mode=ok, slow, hang, busy, drop, die 가운데 하나입니다\"}", NO_STORE);
+            return;
+        }
+        if (f == FT_DIE)
+            raise(SIGKILL); /* 처리 중이던 것까지 그대로 끝난다. demo/run.sh가 몇 초 뒤 다시 켠다 */
+        atomic_store(&g_fault, f);
+        atomic_store(&g_until, f == FT_OK ? 0 : c->loop->now + FAULT_MS);
+    }
+    long long left = atomic_load(&g_until) - c->loop->now;
+    snprintf(out, sizeof out, "{\"mode\":\"%s\",\"left_ms\":%lld}", g_fault_name[fault_now(c)], left > 0 ? left : 0);
+    json(c, 200, out, NO_STORE);
+}
+
+/* ---- 좌석 ---- */
 
 /* 16진수 번호표. 0이나 잘못된 글자면 false */
 static bool parse_who(const char *s, unsigned long long *who)
@@ -150,8 +197,7 @@ static void start_book(struct conn *c)
     char body[64] = "", who_text[18] = "", end;
     int seat = 0;
     unsigned long long who = 0;
-    if (ex->body.size > 0 && ex->body.size < (long long)sizeof body)
-        (void)!spool_read(&ex->body, 0, body, sizeof body - 1);
+    (void)body_text(c, body, sizeof body); /* 너무 길면 비어 있고, 아래 길이 비교에서 걸린다 */
     /* 쓸 수 있는 글자만 있는지 먼저 본다. sscanf는 앞의 공백·부호를 봐주고 NUL 뒤를 보지 못한다 */
     if (strspn(body, "seathwo=&0123456789abcdef") != (size_t)ex->body.size ||
         sscanf(body, "seat=%2d&who=%17s%c", &seat, who_text, &end) != 2 || seat < 1 || seat > SEATS ||
@@ -174,29 +220,53 @@ static void start_book(struct conn *c)
     }
     st->again = owner == who;
     st->seat = seat;
+    st->who = who;
     ex->deadline = c->loop->now + PAY_MS; /* 기다리는 동안 루프는 다른 연결을 처리한다 */
 }
 
-static void seats_start(struct conn *c)
+static void start_show(struct conn *c)
+{
+    char out[256], at[16];
+    struct timespec ts;
+    struct tm tm;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    localtime_r(&ts.tv_sec, &tm);
+    strftime(at, sizeof at, "%H:%M:%S", &tm);
+    snprintf(out, sizeof out,
+             "{\"title\":\"커널의 밤\",\"place\":\"정글 소극장\",\"time\":\"오늘 저녁 8시\",\"made\":\"%s.%03d\",\"by\":%d}",
+             at, (int)(ts.tv_nsec / 1000000), my_port(c));
+    json(c, 200, out, "Cache-Control: max-age=0, s-maxage=5\r\n"); /* 브라우저는 매번 묻고, 프록시만 5초 저장 */
+}
+
+static void serve(struct conn *c)
 {
     struct exchange *ex = c->ex;
     const char *path = ex->path;
-    char out[256], board[SEATS + 1];
-    bool book = !strcmp(path, "/api/book");
-    bool get = ex->req.method == M_GET || ex->req.method == M_HEAD;
-    if (book ? ex->req.method != M_POST : !get) {
-        exchange_error(c, 405, book ? "Allow: POST\r\n" : "Allow: GET, HEAD\r\n");
+    char out[128], board[SEATS + 1];
+    bool book = !strcmp(path, "/api/book"), reset = !strcmp(path, "/api/reset"), show = !strcmp(path, "/api/show");
+    bool work = !strcmp(path, "/api/work") || !strcmp(path, "/rr/work") || !strcmp(path, "/lc/work");
+    bool post = ex->req.method == M_POST, get = ex->req.method == M_GET || ex->req.method == M_HEAD;
+    if (!(get && !book && !reset) && !(post && (book || reset || show || work))) {
+        exchange_error(c, 405, book || reset ? "Allow: POST\r\n" : show || work ? "Allow: GET, HEAD, POST\r\n" : "Allow: GET, HEAD\r\n");
+    } else if (post && (reset || show) && !from_page(c)) {
+        json(c, 403, "{\"error\":\"데모 화면에서 온 요청이 아닙니다\"}", NO_STORE);
     } else if (book) {
         start_book(c);
+    } else if (reset) {
+        for (int i = 0; i < SEATS; i++)
+            atomic_store(&g_seat[i], 0);
+        json(c, 200, "{}", NO_STORE);
+    } else if (work || (show && post)) {
+        snprintf(out, sizeof out, "{\"by\":%d}", my_port(c));
+        json(c, 200, out, NO_STORE);
+    } else if (show) {
+        start_show(c);
     } else if (!strcmp(path, "/api/events")) {
         start_events(c);
     } else if (!strcmp(path, "/api/seats")) {
         read_board(0, board);
         snprintf(out, sizeof out, "{\"board\":\"%s\",\"by\":%d}", board, my_port(c));
         json(c, 200, out, NO_STORE);
-    } else if (!strcmp(path, "/api/show")) {
-        snprintf(out, sizeof out, "{\"title\":\"커널의 밤\",\"place\":\"정글 소극장\",\"time\":\"오늘 저녁 8시\",\"by\":%d}", my_port(c));
-        json(c, 200, out, "Cache-Control: max-age=0, s-maxage=5\r\n"); /* 브라우저는 매번 묻고, 프록시만 5초 저장 */
     } else if (!strcmp(path, "/api/health")) {
         json(c, 200, "{}", NO_STORE);
     } else {
@@ -204,16 +274,51 @@ static void seats_start(struct conn *c)
     }
 }
 
+static void seats_start(struct conn *c)
+{
+    const char *path = c->ex->path;
+    enum fault f = fault_now(c);
+    if (!strncmp(path, "/fault/", 7)) {
+        control(c);
+        return;
+    }
+    /* 멈춤은 헬스 체크까지 답하지 않는다. 나머지 고장은 "살아 있다고 답하지만 일은 제대로 못 하는" 상태 */
+    if (f != FT_HANG && (!strcmp(path, "/api/health") || !strcmp(path, "/api/events")))
+        f = FT_OK;
+    if (f == FT_HANG || f == FT_SLOW)
+        c->ex->deadline = c->loop->now; /* 아직 시작하지 않는다. seats_timeout이 때가 되면 시작한다 */
+    else if (f == FT_BUSY)
+        exchange_error(c, 503, "Retry-After: 1\r\n");
+    else if (f == FT_DROP && strcmp(path, "/api/book"))
+        exchange_abort(c);
+    else
+        serve(c); /* 예매의 drop은 자리를 판 뒤에 끊는다: 손님은 팔렸는지 모르는 채로 남는다 */
+}
+
+/* 0.25~0.5초마다 (ex->deadline이 지난 시각이므로) */
 static void seats_timeout(struct conn *c)
 {
-    struct seat_st *st = c->ex->u.app;
-    if (!st->push) {
+    struct exchange *ex = c->ex;
+    struct seat_st *st = ex->u.app;
+    enum fault f = fault_now(c);
+    bool draining = c->loop->draining;
+    if ((!st || st->push) && c->rd_eof) {
+        exchange_abort(c); /* 손님이 떠났다. 끝나지 않는 응답이거나 고장 때문에 미룬 요청이라, 여기서 알아채야 자리가 빈다 */
+    } else if (f == FT_HANG && !draining) {
+        return;
+    } else if (!st) {
+        if (f == FT_SLOW && !draining && c->loop->now - ex->start_ms < SLOW_MS)
+            return;
+        ex->deadline = 0;
+        serve(c);
+    } else if (!st->push && f == FT_DROP) {
+        exchange_abort(c);
+    } else if (!st->push) {
         char out[64];
+        bool mine = atomic_load(&g_seat[st->seat - 1]) == st->who; /* 결제하는 사이 누가 좌석을 비웠을 수 있다 */
         snprintf(out, sizeof out, "{\"seat\":%d,\"again\":%s,\"by\":%d}", st->seat, st->again ? "true" : "false", my_port(c));
-        json(c, 200, out, NO_STORE);
-    } else if (c->rd_eof) {
-        exchange_abort(c); /* 손님이 떠났다. 끝나지 않는 응답이라 여기서 알아채야 자리가 빈다 */
-    } else if (c->loop->draining) {
+        json(c, mine ? 200 : 409, out, NO_STORE);
+    } else if (draining) {
         exchange_finish(c); /* 종료 중: 여기서 끝내면 브라우저가 다시 연결한다 */
     } else {
         push(c);
