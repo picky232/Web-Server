@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>발표 그림</title>
+<style>
+  html, body { margin: 0; background: #FFF8F0; }
+  body { font-family: "Pretendard", "Apple SD Gothic Neo", "Noto Sans KR", system-ui, sans-serif; }
+  svg text { font-family: inherit; }
+  pre#audit { display: none; }
+</style>
+</head>
+<body>
+<div id="fig"></div>
+<script src="audit.js"></script>
+<script>
+/* 발표용 그림 (알약 노드 스타일 + 조금 강조)
+   규칙: 1280×720 · 안전 여백 좌우 100/상하 60 · 글자 폭은 측정해서 맞춤 · 글자와 선 사이 8px 이상 · 선 끝은 100~1180에 맞춤
+   강조는 주홍 하나: 핵심 노드(윤곽+옅은 면), 핵심 숫자(주홍+밑줄), 핵심 행(옅은 띠) */
+const W = 1280, H = 720, X0 = 100, X1 = 1180;
+const V = '#E8472B', INK = '#1D1B1A', SUB = '#7A6A62', LINE = '#D9CCC2', EDGE = '#CFC0B4', BG = '#FFF8F0', TINT = '#FFE9DF', GRAY = '#CDBDB0';
+const FONT = '"Pretendard","Apple SD Gothic Neo","Noto Sans KR",system-ui,sans-serif';
+const ctx = document.createElement('canvas').getContext('2d');
+const mw = (t, s, w = 500) => { ctx.font = `${w} ${s}px ${FONT}`; return ctx.measureText(t).width; };
+const fit = (t, s, w, max, min = 18) => { while (s > min && mw(t, s, w) > max) s -= 1; return s; };
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+const num = (n) => n.toLocaleString('en-US');
+
+const open = () => `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="${EDGE}"/></marker>
+  <marker id="av" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="${V}"/></marker></defs><rect width="${W}" height="${H}" fill="${BG}"/>`;
+const T = (x, y, t, s, w, fill, a = 'start') => `<text x="${x}" y="${y}" text-anchor="${a}" font-size="${s}" font-weight="${w}" fill="${fill}">${esc(t)}</text>`;
+const title = (t) => T(X0, 120, t, 46, 800, INK);
+const foot = (t) => T(X0, 648, t, fit(t, 20, 500, X1 - X0), 500, SUB);
+const hl = (x1, y1, x2, y2, c = LINE, w = 2) => `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${c}" stroke-width="${w}"/>`;
+const arrow = (pts, c = EDGE, dash = false) => `<path d="M${pts.map((p) => p.join(' ')).join(' L')}" fill="none" stroke="${c}" stroke-width="3" stroke-linejoin="round" ${dash ? 'stroke-dasharray="9 7"' : ''} marker-end="url(#${c === V ? 'av' : 'ah'})"/>`;
+/* 알약: 윤곽선 + 글자. hi=강조(주홍 윤곽+옅은 면), dash=점선 */
+const pill = (x, y, h, t, s, wt, o = {}) => { const pad = o.pad ?? 30, w = o.w ?? Math.round(mw(t, s, wt) + pad * 2), sz = o.w ? fit(t, s, wt, w - pad * 2) : s;
+  const stroke = o.hi ? V : EDGE, fill = o.hi ? TINT : 'none';
+  return { x, y, w, h, cx: x + w / 2, cy: y + h / 2, r: x + w, svg: `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${h / 2}" fill="${fill}" stroke="${stroke}" stroke-width="${o.hi ? 3 : 2.5}" ${o.dash ? 'stroke-dasharray="8 6"' : ''}/>` + T(x + w / 2, y + h / 2 + sz * 0.34, t, sz, wt, o.tc ?? INK, 'middle') }; };
+/* 큰 숫자 + 단위 + 밑줄, 가운데 정렬 */
+const big = (cx, y0, label, n, unit, cap, o = {}) => { const ns = o.size ?? 76, nw = mw(n, ns, 800), uw = mw(unit, 26, 600), sx = cx - (nw + 12 + uw) / 2, cs = fit(cap, 22, 500, o.capMax ?? 440);
+  return T(cx, y0, label, 28, 700, SUB, 'middle') + T(sx, y0 + 84, n, ns, 800, V) + T(sx + nw + 12, y0 + 84, unit, 26, 600, SUB) + `<rect x="${sx}" y="${y0 + 100}" width="${nw}" height="5" rx="2.5" fill="${V}"/>` + T(cx, y0 + 146, cap, cs, 500, SUB, 'middle'); };
+const FIGS = {};
+
+/* 1. 요청 하나의 흐름 */
+FIGS.flow = () => { let o = open() + title('요청 하나의 흐름');
+  const labels = ['클라이언트', '메인 스레드', '이벤트 루프', '주소 확인'], s = 28, h = 68, pad = 32, ws = labels.map((t) => Math.round(mw(t, s, 700) + pad * 2)), gap = (X1 - X0 - ws.reduce((a, b) => a + b, 0)) / 3;
+  let x = X0; const ps = [];
+  labels.forEach((t, i) => { const p = pill(x, 190, h, t, s, 700, { w: ws[i], hi: i === 3 }); ps.push(p); o += p.svg; if (i < 3) o += arrow([[x + ws[i] + 8, 224], [x + ws[i] + gap - 10, 224]]); x += ws[i] + gap; });
+  const bx = ps[3].cx, cL = 330, cR = 860;
+  o += arrow([[bx, 266], [bx, 330], [cL, 330], [cL, 402]]) + arrow([[bx, 330], [cR, 330], [cR, 402]]);
+  o += T(cL + 14, 376, '/api/ 가 아니면', 22, 600, SUB) + T(cR + 14, 376, '/api/ 로 시작하면', 22, 600, SUB);
+  o += big(cL, 452, '정적 파일', '102,029', 'req/s', '/index.html · 디스크에서 바로 응답') + big(cR, 452, '프록시', '약 45,000', 'req/s', '/api/hello · 캐시에 있으면 13만+ req/s');
+  return o + foot('같은 컴퓨터(macOS), 1KB 응답, 동시 64 · 캐시 hit은 두 번 재서 13만~18만(편차 큼)') + '</svg>'; };
+
+/* 2. 연결 전담 */
+FIGS.pin = () => { let o = open() + title('연결 하나는 끝까지 한 스레드가 전담');
+  const ys = [190, 278, 366], mainP = pill(X0, 276, 68, '메인 스레드', 28, 700);
+  o += mainP.svg + arrow([[mainP.r + 8, 310], [360, 310], [360, 222], [418, 222]]) + arrow([[mainP.r + 8, 310], [418, 310]]) + arrow([[360, 310], [360, 398], [418, 398]]);
+  const groups = [['A', 'B', 'C'], ['D', 'E'], ['F']];
+  ys.forEach((y, i) => { const lp = pill(420, y, 64, `이벤트 루프 ${i + 1}`, 28, 700, { w: 260, hi: true }); o += lp.svg; let cx = 740;
+    groups[i].forEach((c) => { const t = `연결 ${c}`, w = Math.round(mw(t, 22, 700) + 36); o += pill(cx, y + 10, 44, t, 22, 700, { w, tc: SUB }).svg; cx += w + 14; }); });
+  o += T(X0, 480, '연결은 받을 때 한 번, 연결 수가 가장 적은 루프에 배정됩니다', 24, 500, SUB) + hl(X0, 512, X1, 512) + hl(640, 534, 640, 640, LINE, 1.5);
+  const col = (x, head, items) => { let r = T(x, 560, head, 30, 800, INK); items.forEach((t, i) => { const y = 600 + i * 36; r += `<circle cx="${x + 5}" cy="${y - 8}" r="4.5" fill="${V}"/>` + T(x + 22, y, t, fit(t, 24, 500, 500), 500, SUB); }); return r; };
+  return o + col(X0, '얻는 것', ['락이 필요 없다', '기다리는 연결이 스레드를 안 잡는다']) + col(680, '감수하는 것', ['오래 걸리면 그 루프만 기다림', '워커가 죽으면 전부 죽음 → 감독이 교체']) + '</svg>'; };
+
+/* 3. 말 없는 연결 */
+FIGS.silent = () => { let o = open() + title('말 없는 연결이 많아도 느려지지 않는다');
+  const lg = (x, c, t) => `<circle cx="${x + 7}" cy="163" r="7" fill="${c}"/>` + T(x + 22, 171, t, 22, 500, SUB), t1 = '이전 구현 (스레드 풀 8개)';
+  o += lg(X0, GRAY, t1) + lg(X0 + 22 + mw(t1, 22, 500) + 50, V, '이 서버 (이벤트 루프)');
+  const x0 = 420, full = 600, max = 40000;
+  [{ g: '침묵 연결 0개', old: [0.37, '0.37 ms'], me: [0.29, '0.29 ms'] }, { g: '침묵 연결 8개', s: '이 서버는 4개로 측정', old: [9700, '9,700 ms'], me: [0.28, '0.28 ms'] }, { g: '침묵 연결 72개', s: '이 서버는 1,000개로 측정', old: [max, '40초 안에 응답 없음'], me: [0.25, '0.25 ms'] }].forEach((r, i) => {
+    const y0 = 226 + i * 116; o += T(X0, y0 + 28, r.g, 28, 700, INK) + (r.s ? T(X0, y0 + 60, r.s, 22, 500, SUB) : '');
+    [['old', GRAY, 0, SUB], ['me', V, 50, V]].forEach(([k, c, dy, tc]) => { const [v, lab] = r[k], w = Math.max(8, Math.min(1, v / max) * full), y = y0 + dy;
+      o += `<rect x="${x0}" y="${y}" width="${w}" height="38" rx="${Math.min(19, w / 2)}" fill="${c}"/>` + (w > mw(lab, 24, 800) + 60 ? T(x0 + w - 20, y + 27, lab, 24, 800, '#fff', 'end') : T(x0 + w + 14, y + 28, lab, 26, 800, tc)); }); });
+  const msg = '연결 상한(4,096개)이 차도 정상 요청은 약 0.3 ms · 초과분은 서버가 먼저 끊음', ms = fit(msg, 26, 700, X1 - X0 - 80), mwid = Math.round(mw(msg, ms, 700) + 80);
+  o += pill(640 - mwid / 2, 590, 54, msg, ms, 700, { w: mwid, hi: true, pad: 40 }).svg;
+  return o + '</svg>'; };
+
+/* 4. 처리량 */
+FIGS.thru = () => { let o = open() + title('연결이 늘어도 처리량이 유지된다');
+  const lg = (x, c, t) => `<circle cx="${x + 7}" cy="163" r="7" fill="${c}"/>` + T(x + 22, 171, t, 22, 500, SUB), t1 = '이전 구현 (스레드 풀)';
+  o += lg(X0, GRAY, t1) + lg(X0 + 22 + mw(t1, 22, 500) + 50, V, '이 서버 (이벤트 루프)');
+  const data = [[1, 23524, 16684], [4, 74096, 56299], [16, 98415, 33583], [64, 102029, 27078], [200, 100340, 32539], [500, 100607, 32062]], x0 = 270, sc = 700 / 110000;
+  data.forEach(([c, me, old], i) => { const top = 198 + i * 64;
+    if (c === 64) o += `<rect x="${X0}" y="${top}" width="${X1 - X0}" height="60" rx="16" fill="${TINT}"/>` + T(X1 - 20, top + 39, '3.8배', 28, 800, V, 'end');
+    o += T(X0 + 16, top + 38, `동시 ${c}`, 26, 700, INK);
+    o += `<rect x="${x0}" y="${top + 9}" width="${old * sc}" height="18" rx="9" fill="${GRAY}"/>` + T(x0 + old * sc + 10, top + 25, num(old), 22, 700, SUB) +
+      `<rect x="${x0}" y="${top + 33}" width="${me * sc}" height="18" rx="9" fill="${V}"/>` + T(x0 + me * sc + 10, top + 49, num(me), 22, 800, V); });
+  return o + foot('이전 구현은 동시 200부터 연결이 끊겨 큐를 1024로 늘려 잰 값 · keep-alive가 없으면 차이가 작음') + '</svg>'; };
+
+/* 5. 백엔드 장애 */
+FIGS.fail = () => { let o = open() + title('백엔드가 죽어도 응답이 이어진다');
+  const cl = pill(X0, 236, 68, '클라이언트', 28, 700), px = pill(cl.r + 80, 228, 84, '프록시', 30, 800, { hi: true, pad: 40 });
+  o += cl.svg + arrow([[cl.r + 8, 270], [px.x - 8, 270]]) + px.svg;
+  const b1 = pill(880, 158, 64, '백엔드 9001 · 꺼짐', 26, 700, { w: 300, dash: true, tc: SUB }), b2 = pill(880, 318, 64, '백엔드 9002', 26, 700, { w: 300, hi: true });
+  o += b1.svg + b2.svg + arrow([[px.r + 8, 270], [660, 270], [660, 190], [872, 190]], EDGE, true) + arrow([[px.r + 8, 270], [660, 270], [660, 350], [872, 350]], V);
+  o += T(676, 178, '① 연결 거절', 22, 600, SUB) + T(676, 338, '② 다시 보냄', 22, 600, V);
+  o += hl(X0, 440, X1, 440) + hl(640, 462, 640, 600, LINE, 1.5);
+  o += T(X0, 496, '손님은 장애를 모릅니다', 30, 800, INK) + T(X0, 542, '200 OK 를 그대로 받음', 28, 800, V);
+  o += T(680, 496, '다시 보내는 규칙', 30, 800, INK) + T(680, 542, '안 보냈으면 다른 곳으로', 24, 500, SUB) + T(680, 578, 'POST는 한 번만, GET·HEAD는 한 번 더', fit('POST는 한 번만, GET·HEAD는 한 번 더', 24, 500, 500), 500, SUB);
+  return o + foot('헬스 체크: 연속 3번 실패하면 제외, 2번 성공하면 복귀') + '</svg>'; };
+
+/* 6. 감독 프로세스 */
+FIGS.sup = () => { let o = open() + title('감독 프로세스가 워커를 지킨다');
+  [['설정을 바꿀 때', [['새 워커 띄움'], ['준비됨'], ['옛 워커 퇴장']]], ['워커가 멈췄을 때', [['10번 연속 소식 없음', '1초마다 확인'], ['새 워커로 교체']]], ['워커가 죽었을 때', [['죽음 (원인 기록)'], ['0.1초 뒤 다시 띄움', '거듭 죽으면 두 배씩, 최대 30초']]]].forEach(([lab, seq], i) => {
+    const cy = 230 + i * 140; o += T(X0, cy + 10, lab, 28, 700, SUB); let x = 400;
+    seq.forEach(([t, cap], k) => { const p = pill(x, cy - 34, 68, t, 28, 700, { hi: k === 1 }); o += p.svg + (cap ? T(p.cx, cy + 66, cap, fit(cap, 22, 500, 420), 500, SUB, 'middle') : ''); if (k < seq.length - 1) o += arrow([[p.r + 8, cy], [p.r + 62, cy]]); x = p.r + 70; }); });
+  return o + foot('감독이 연결 받는 소켓을 쥐고 있어서 워커가 바뀌는 동안에도 연결을 받습니다') + '</svg>'; };
+
+/* 8. 테스트와 결과 */
+FIGS.tests = () => { let o = open() + title('엣지 케이스와 장애 시험');
+  const head = (x, y, t) => T(x, y, t, 30, 800, INK) + `<rect x="${x}" y="${y + 12}" width="40" height="4" rx="2" fill="${V}"/>`;
+  const code = (xr, base, t) => { const w = Math.round(mw(t, 21, 800) + 28); return `<rect x="${xr - w}" y="${base - 27}" width="${w}" height="36" rx="18" fill="none" stroke="${EDGE}" stroke-width="2.5"/>` + T(xr - w / 2, base - 2, t, 21, 800, V, 'middle'); };
+  o += hl(650, 180, 650, 624, LINE, 1.5) + head(X0, 196, '잘못된 요청');
+  [['끝나지 않은 헤더 (제한 2초)', '408'], ['잘못된 메서드 · 버전', '501 · 505'], ['주소 · 헤더 20,000바이트', '414 · 431'], ['헤더 충돌 · 중복', '400'], ['경로 탈출 · 숨김 · 링크', '400 · 403'], ['본문 상한 초과 (2,000B > 1k)', '413']].forEach(([a, c], i, arr) => {
+    const b = 256 + i * 48; o += T(X0, b, a, fit(a, 24, 500, 340), 500, INK) + code(620, b, c) + (i < arr.length - 1 ? hl(X0, b + 18, 620, b + 18, LINE, 1.5) : ''); });
+  o += T(X0, 548, '408은 2.0초 뒤, 나머지는 모두 1 ms 미만에 응답', 22, 500, SUB);
+  o += head(680, 196, '백엔드 장애');
+  [['응답 없는 백엔드', '504', '1.005초'], ['연결 거절 백엔드뿐', '502', '1 ms'], ['죽은 곳 + 산 곳 20개', '200', '20/20']].forEach(([a, c, t], i, arr) => { const b = 256 + i * 48; o += T(680, b, a, 24, 500, INK) + code(1090, b, c) + T(X1, b, t, 21, 600, SUB, 'end') + (i < arr.length - 1 ? hl(680, b + 18, X1, b + 18, LINE, 1.5) : ''); });
+  o += head(680, 412, '연결 끊김과 복구');
+  [['끊은 연결 500개', 'fd 536 → 36 회수'], ['워커 kill -9', '109 ms 복구'], ['워커 kill -STOP', '11.0초 복구'], ['설정 다시 읽기', '새 연결 실패 0']].forEach(([a, t], i, arr) => { const b = 472 + i * 48; o += T(680, b, a, 24, 500, INK) + T(X1, b, t, 24, 800, V, 'end') + (i < arr.length - 1 ? hl(680, b + 18, X1, b + 18, LINE, 1.5) : ''); });
+  return o + foot('keep-alive로 이미 맺어 둔 연결은 워커가 바뀔 때 끊겨서 클라이언트가 다시 연결해야 합니다') + '</svg>'; };
+
+/* 9. 비교 테스트 */
+FIGS.compare = () => { let o = open() + title('다른 구현과 같은 조건으로 비교');
+  const rows = [{ n: '이 서버', rps: 85736, slow: [true, '0.59 ms'], c: 10, me: true }, { n: '이전 구현', s: '스레드 풀', rps: 32879, slow: [false, '응답 없음'], c: 10 }, { n: '팀 구현 A', s: '스레드 풀', rps: 33291, slow: [false, '응답 없음'], c: 3 }, { n: '팀 구현 B', s: '단일 스레드 이벤트 루프', rps: 25531, slow: [true, '0.62 ms'], c: 0 }];
+  [['구현', X0 + 16], ['처리량 · 동시 100', 380], ['느린 연결 300개일 때', 700], ['동시 1000 완주', 980]].forEach(([t, x]) => { o += T(x, 206, t, 22, 700, SUB); });
+  o += hl(X0, 224, X1, 224, INK, 2);
+  rows.forEach((r, i) => { const top = 232 + i * 86, mid = top + 43;
+    if (r.me) o += `<rect x="${X0}" y="${top}" width="${X1 - X0}" height="82" rx="16" fill="${TINT}"/>`;
+    o += T(X0 + 16, mid + (r.s ? -2 : 10), r.n, 30, 800, INK) + (r.s ? T(X0 + 16, mid + 26, r.s, 21, 500, SUB) : '');
+    const w = r.rps / 90000 * 180; o += `<rect x="380" y="${mid - 9}" width="${w}" height="18" rx="9" fill="${r.me ? V : GRAY}"/>` + T(380 + w + 12, mid + 8, num(r.rps), 26, 800, r.me ? V : SUB);
+    const sp = pill(700, mid - 22, 44, r.slow[1], 24, 800, { w: 200, hi: r.slow[0], dash: !r.slow[0], tc: r.slow[0] ? V : SUB }), cp = pill(980, mid - 22, 44, `${r.c} / 10`, 24, 800, { w: 150, hi: r.c === 10, dash: r.c < 10, tc: r.c === 10 ? V : SUB });
+    o += sp.svg + cp.svg + (i < 3 ? hl(X0, top + 84, X1, top + 84, LINE, 1.5) : ''); });
+  o += T(X0, 608, '처리량: 10,000건을 3번 재서 중앙값 · 느린 연결: 요청을 절반만 보낸 연결 300개를 연 채 정상 요청 1개', fit('처리량: 10,000건을 3번 재서 중앙값 · 느린 연결: 요청을 절반만 보낸 연결 300개를 연 채 정상 요청 1개', 20, 500, X1 - X0), 500, SUB);
+  return o + foot('동시 1000 완주: ab가 연결 끊김 없이 끝까지 간 횟수 (끊기는 원인은 확인하지 못함)') + '</svg>'; };
+
+/* 7. 전체 구조도: 세 구역(손님 / 서버 / 백엔드). 이 그림만 굵은 선 블록 스타일(검정 굵은 선, 각진 상자) */
+FIGS.arch = () => { const IK = INK, BGA = '#FFFDF9';
+  const sv = open().replace(`fill="${BG}"/>`, `fill="${BGA}"/>`).replace(new RegExp(EDGE, 'g'), IK);
+  const box = (x, y, w, h, t, sz, o = {}) => { const s = fit(t, sz, 700, w - 28);
+    return { x, y, w, h, r: x + w, cx: x + w / 2, svg: `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="10" fill="${o.hi ? V : '#FFFFFF'}" stroke="${IK}" stroke-width="2.5"/>` + T(x + w / 2, y + h / 2 + s * 0.34, t, s, 700, o.hi ? '#fff' : (o.tc ?? INK), 'middle') }; };
+  const ar = (pts, dash) => arrow(pts, IK, dash);
+  const auto = (t, sz) => Math.round(mw(t, sz, 700) + 56);
+  let o = sv + title('전체 구조') + hl(312, 160, 312, 640, IK, 1.5) + hl(924, 160, 924, 640, IK, 1.5) + T(206, 190, '손님', 22, 700, SUB, 'middle') + T(618, 190, '서버', 22, 700, SUB, 'middle') + T(1052, 190, '백엔드', 22, 700, SUB, 'middle');
+  const cl = box(X0, 352, 180, 60, '클라이언트', 24);
+  o += cl.svg + box(510, 214, 216, 50, '감독 프로세스', 24).svg + ar([[618, 268], [618, 296]]) + T(634, 290, '띄우고 지킴', 20, 500, SUB);
+  o += `<rect x="350" y="304" width="540" height="316" rx="22" fill="#FFF1E9" stroke="${IK}" stroke-width="3"/>` + T(372, 338, '워커 프로세스 1개', 22, 700, V);
+  const mp = box(372, 356, auto('메인 스레드', 24), 52, '메인 스레드', 24);
+  o += mp.svg + T(mp.r + 16, 389, '연결 받기 · 헬스 체크', 22, 500, SUB) + box(372, 428, 496, 56, '이벤트 루프 스레드 1 … N', 26, { hi: true }).svg;
+  let cx = 372; ['정적 파일', '프록시', '캐시'].forEach((t) => { const w = Math.round(mw(t, 24, 700) + 40); o += box(cx, 504, w, 52, t, 24, { tc: SUB }).svg; cx += w + 14; });
+  o += T(372, 594, '요청 처리 · 연결은 끝까지 한 스레드가 맡음', 22, 500, SUB);
+  return o + ar([[cl.r + 8, 382], [364, 382]]) + box(960, 330, 220, 56, '백엔드 1', 26).svg + box(960, 430, 220, 56, '백엔드 N', 26).svg + ar([[898, 460], [940, 460], [940, 358], [952, 358]]) + ar([[940, 460], [940, 458], [952, 458]]) + '</svg>'; };
+
+/* 0. 배너 */
+FIGS.banner = () => {
+  const V1 = '#E8472B', V2 = '#FF6A3D', VD = '#B3301A', V3 = '#C93C22', CREAM = '#FFF4EA';
+  const iso = (cx, cy, k) => [2, 1, 0].map((i) => { const y = cy + (i - 1) * 62 * k, w = 110 * k, h = 55 * k, t = 36 * k;
+    return `<polygon points="${cx - w},${y} ${cx},${y + h} ${cx},${y + h + t} ${cx - w},${y + t}" fill="${VD}"/><polygon points="${cx + w},${y} ${cx},${y + h} ${cx},${y + h + t} ${cx + w},${y + t}" fill="${V3}"/><polygon points="${cx},${y - h} ${cx + w},${y} ${cx},${y + h} ${cx - w},${y}" fill="${V2}"/><circle cx="${cx - w * 0.45}" cy="${y + h * 0.78 + t * 0.35}" r="${6 * k}" fill="${V2}"/>`; }).join('');
+  const BF = '-apple-system, BlinkMacSystemFont, \'SF Pro Display\', \'Apple SD Gothic Neo\', \'Helvetica Neue\', sans-serif';
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="500" viewBox="0 0 1200 500" font-family="${BF}">
+    <rect width="1200" height="500" fill="${CREAM}"/>${iso(240, 250, 1.1)}
+    <text x="470" y="238" font-size="112" font-weight="500" letter-spacing="-3" fill="#1D1B1A">Web <tspan fill="${V1}">Server</tspan></text>
+    <text x="474" y="362" font-size="38" font-weight="800" fill="${V1}">Krafton Jungle WEEK13</text>
+    <text x="474" y="414" font-size="24" font-weight="500" fill="#1D1B1A">Team 10 &#160;<tspan text-decoration="underline">@picky232</tspan> · <tspan text-decoration="underline">@rlatmdgus388</tspan> · <tspan text-decoration="underline">@a01030704572-bit</tspan></text>
+  </svg>`;
+};
+
+const id = new URLSearchParams(location.search).get('fig') || 'flow';
+document.getElementById('fig').innerHTML = FIGS[id]();
+addEventListener('load', () => { const v = document.querySelector('svg'); document.documentElement.dataset.h = v.getAttribute('height');
+  if (location.search.includes('audit') && id !== 'banner') { const r = auditSvg(v, id), pre = document.createElement('pre'); pre.id = 'audit'; pre.textContent = JSON.stringify(r); document.body.appendChild(pre); } });
+</script>
+</body>
+</html>
