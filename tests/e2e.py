@@ -1,0 +1,1657 @@
+#!/usr/bin/env python3
+"""기능 테스트: 실제 서버를 띄우고 소켓으로 요청을 보내 확인한다 (표준 라이브러리만).
+
+    make e2e
+    WEBSERVER=build/asan/webserver python3 tests/e2e.py [-k 이름]
+"""
+import hashlib
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BIN = str(ROOT / os.environ.get("WEBSERVER", "build/webserver"))
+H = b"Host: x\r\n"
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class Server:
+    """설정 파일을 만들어 서버를 띄운다"""
+
+    def __init__(self, conf, **popen):
+        self.dir = tempfile.mkdtemp(prefix="webserver-e2e-")
+        self.port, self.admin = free_port(), free_port()
+        path = os.path.join(self.dir, "server.conf")
+        with open(path, "w") as f:
+            f.write(f"listen 127.0.0.1:{self.port}\nadmin 127.0.0.1:{self.admin}\nloops 3\naccess_log {self.dir}/access.log\n" +
+                    conf.replace("@PORT@", str(self.port)))
+        self.err = open(os.path.join(self.dir, "stderr"), "w+")
+        self.p = subprocess.Popen([BIN, "-c", path], stderr=self.err, **popen)
+        end = time.time() + 10
+        while time.time() < end:
+            try:
+                socket.create_connection(("127.0.0.1", self.port), 1).close()
+                return
+            except OSError:
+                if self.p.poll() is not None:
+                    break
+                time.sleep(0.02)
+        raise RuntimeError("서버가 뜨지 않음: " + self.stderr())
+
+    def stderr(self):
+        self.err.flush()
+        return Path(self.err.name).read_text()
+
+    def stop(self, sig=signal.SIGTERM):
+        if self.p.poll() is None:
+            self.p.send_signal(sig)
+        code = self.p.wait(20)
+        text = self.stderr()
+        self.err.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+        if code != 0 or re.search(r"Sanitizer|runtime error", text):
+            raise AssertionError(f"종료 코드 {code}\n{text[-3000:]}")
+
+    # --- 요청 보내기 ---
+    def raw(self, *parts, timeout=3, eof=False, delay=0.03, port=None):
+        """바이트를 그대로 보내고 받은 것 전부와 끝난 모양('EOF', 'OPEN', 'RST')을 돌려준다"""
+        s = socket.create_connection(("127.0.0.1", port or self.port))
+        s.settimeout(timeout)
+        out, end = b"", "OPEN"
+        try:
+            for i, x in enumerate(parts):
+                if i:
+                    time.sleep(delay)
+                s.sendall(x)
+            if eof:
+                s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            while True:
+                d = s.recv(1 << 16)
+                if not d:
+                    end = "EOF"
+                    break
+                out += d
+        except socket.timeout:
+            pass
+        except ConnectionError:
+            end = "RST"
+        s.close()
+        return out, end
+
+    def get(self, path, method="GET", headers=(), body=b"", host="x", version="1.1", timeout=5):
+        """요청 하나. Connection: close로 끝까지 받아 (상태, 헤더 dict, 본문)"""
+        h = "".join(f"{k}: {v}\r\n" for k, v in headers)
+        if body:
+            h += f"Content-Length: {len(body)}\r\n"
+        req = f"{method} {path} HTTP/{version}\r\nHost: {host}\r\nConnection: close\r\n{h}\r\n".encode() + body
+        out, end = self.raw(req, timeout=timeout)
+        return parse(out, method == "HEAD") + (end,)
+
+
+def parse(raw, head=False):
+    i = raw.index(b"\r\n\r\n")
+    lines = raw[:i].decode("latin1").split("\r\n")
+    headers = {}
+    for x in lines[1:]:
+        k, v = x.split(":", 1)
+        headers.setdefault(k.lower(), v.strip())
+    body = raw[i + 4:]
+    if headers.get("transfer-encoding") == "chunked" and not head:
+        body = unchunk(body)
+    return int(lines[0].split()[1]), headers, body
+
+
+def unchunk(b):
+    out = b""
+    while True:
+        i = b.index(b"\r\n")
+        n = int(b[:i].split(b";")[0], 16)
+        out, b = out + b[i + 2:i + 2 + n], b[i + 2 + n + 2:]
+        if n == 0:
+            return out
+
+
+def statuses(raw):
+    return [int(x) for x in re.findall(rb"HTTP/1\.1 (\d{3})", raw)]
+
+
+class Case(unittest.TestCase):
+    conf = ""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.www = tempfile.mkdtemp(prefix="webserver-www-")
+        cls.files(cls.www)
+        cls.s = Server(cls.make_conf())
+
+    @classmethod
+    def files(cls, d):
+        pass
+
+    @classmethod
+    def make_conf(cls):
+        return f"route * / static {cls.www}\n"
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.s.stop()
+        finally:
+            shutil.rmtree(cls.www, ignore_errors=True)
+
+
+class Parsing(Case):
+    @classmethod
+    def files(cls, d):
+        Path(d, "index.html").write_text("hello")
+
+    def test_bad_requests(self):
+        for req, want in [
+            (b"GET / HTTP/1.1\r\n\r\n", 400), (b"GET / HTTP/1.1\r\n" + H + H + b"\r\n", 400),
+            (b"GET /\r\n" + H + b"\r\n", 400), (b"G@T / HTTP/1.1\r\n" + H + b"\r\n", 400),
+            (b"BREW / HTTP/1.1\r\n" + H + b"\r\n", 501), (b"GET / HTTP/2.0\r\n" + H + b"\r\n", 505),
+            (b"GET / HTTP/1.1\n" + H + b"\n", 400), (b"\x16\x03\x01\x02", 400),
+            (b"GET /../x HTTP/1.1\r\n" + H + b"\r\n", 400), (b"GET /%2e%2e/x HTTP/1.1\r\n" + H + b"\r\n", 400),
+            (b"GET /%00 HTTP/1.1\r\n" + H + b"\r\n", 400), (b"GET /" + b"a" * 20000, 414),
+            (b"GET / HTTP/1.1\r\n" + H + b"X: " + b"a" * 20000, 431),
+            (b"CONNECT a:443 HTTP/1.1\r\n" + H + b"\r\n", 501),
+            (b"POST / HTTP/1.1\r\n" + H + b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n", 400),
+        ]:
+            out, end = self.s.raw(req)
+            self.assertEqual((statuses(out), end), ([want], "EOF"), req[:60])
+            self.assertIn(b"Connection: close", out)
+
+    def test_split_anywhere(self):
+        req = b"GET / HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n"
+        for i in range(1, len(req), 7):
+            out, _ = self.s.raw(req[:i], req[i:], delay=0.01)
+            self.assertEqual(statuses(out), [200])
+        out, _ = self.s.raw(*[req[i:i + 1] for i in range(len(req))], delay=0.002)
+        self.assertEqual(statuses(out), [200])
+
+    def test_pipeline_order(self):
+        one = b"GET / HTTP/1.1\r\n" + H + b"\r\n"
+        out, end = self.s.raw(one * 60 + b"GET /none HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        self.assertEqual((statuses(out), end), ([200] * 60 + [404], "EOF"))
+
+    def test_keep_alive_rules(self):
+        self.assertEqual(self.s.raw(b"GET / HTTP/1.1\r\n" + H + b"\r\n", timeout=0.4)[1], "OPEN")
+        self.assertEqual(self.s.raw(b"GET / HTTP/1.0\r\n\r\n", timeout=1)[1], "EOF")
+        self.assertEqual(self.s.raw(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", timeout=0.4)[1], "OPEN")
+
+    def test_absolute_form_and_options(self):
+        self.assertEqual(statuses(self.s.raw(b"GET http://any:1/ HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")[0]), [200])
+        self.assertEqual(statuses(self.s.raw(b"OPTIONS * HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")[0]), [204])
+        self.assertEqual(statuses(self.s.raw(b"OPTIONS http://x HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")[0]), [204])
+        self.assertEqual(statuses(self.s.raw(b"OPTIONS / HTTP/1.1\r\n" + H + b"Max-Forwards: 0\r\nConnection: close\r\n\r\n")[0]), [204])
+
+    def test_expect_never_after_final(self):
+        # 예전 구현의 결함: 최종 응답 뒤에 100을 또 보냈다
+        out, _ = self.s.raw(b"POST /.env HTTP/1.1\r\n" + H + b"Content-Length: 5\r\nExpect: 100-continue\r\n\r\n")
+        self.assertEqual(statuses(out), [405])
+
+    def test_half_close_still_answers(self):
+        out, end = self.s.raw(b"GET / HTTP/1.1\r\n" + H + b"\r\n", eof=True)
+        self.assertEqual((statuses(out), end), ([200], "EOF"))
+
+
+class Static(Case):
+    @classmethod
+    def files(cls, d):
+        p = Path(d)
+        (p / "sub").mkdir()
+        (p / "empty").mkdir()
+        (p / "index.html").write_text("<h1>root</h1>")
+        (p / "sub/index.html").write_text("sub")
+        for n in ("a.css", "a.js", "a.png", "a.jpg", "한글 이름.txt", ".env"):
+            (p / n).write_text(n)
+        (p / "big.bin").write_bytes(os.urandom(5 << 20))
+        os.symlink("/etc/hosts", p / "link")
+        os.symlink("/etc", p / "etc")
+        os.mkfifo(p / "fifo")
+        (p / "secret").write_text("x")
+        os.chmod(p / "secret", 0)
+
+    def test_mime_and_body(self):
+        for path, mime in [("/", "text/html"), ("/a.css", "text/css"), ("/a.js", "text/javascript"),
+                           ("/a.png", "image/png"), ("/a.jpg", "image/jpeg"), ("/sub/", "text/html")]:
+            st, h, body, _ = self.s.get(path)
+            self.assertEqual(st, 200, path)
+            self.assertTrue(h["content-type"].startswith(mime), path)
+            self.assertEqual(int(h["content-length"]), len(body))
+        st, _, body, _ = self.s.get("/%ED%95%9C%EA%B8%80%20%EC%9D%B4%EB%A6%84.txt?q=1")
+        self.assertEqual((st, body.decode()), (200, "한글 이름.txt"))
+
+    def test_big_file_is_exact(self):
+        want = hashlib.sha256(Path(self.www, "big.bin").read_bytes()).hexdigest()
+        st, _, body, _ = self.s.get("/big.bin")
+        self.assertEqual((st, hashlib.sha256(body).hexdigest()), (200, want))
+
+    def test_head(self):
+        st, h, body, _ = self.s.get("/a.css", method="HEAD")
+        self.assertEqual((st, h["content-length"], body), (200, "5", b""))
+
+    def test_errors(self):
+        for path, want in [("/none", 404), ("/sub/none/x", 404), ("/.env", 403), ("/link", 403), ("/etc/hosts", (403, 404)),
+                           ("/fifo", 403), ("/empty/", 403), ("/secret", 403), ("/" + "n" * 300, 404)]:
+            st = self.s.get(path)[0]
+            self.assertIn(st, want if isinstance(want, tuple) else (want,), path)
+
+    def test_directory_redirect_stays_here(self):
+        # 예전 구현의 결함: //sub → Location: //sub/ (다른 호스트로 튐)
+        for path in ("/sub", "//sub", "/sub?a=1"):
+            st, h, _, _ = self.s.get(path)
+            self.assertEqual((st, h["location"].split("?")[0]), (301, "/sub/"), path)
+
+    def test_methods(self):
+        st, h, _, _ = self.s.get("/a.css", method="POST", body=b"x")
+        self.assertEqual((st, h["allow"]), (405, "GET, HEAD"))
+
+    def test_conditional(self):
+        _, h, _, _ = self.s.get("/a.css")
+        for head in (("If-None-Match", h["etag"]), ("If-None-Match", '"zz", W/' + h["etag"]), ("If-None-Match", "*"),
+                     ("If-Modified-Since", h["last-modified"])):
+            st, h2, body, _ = self.s.get("/a.css", headers=[head])
+            self.assertEqual((st, body, h2["etag"]), (304, b"", h["etag"]))
+            self.assertNotIn("content-length", h2)
+        self.assertEqual(self.s.get("/a.css", headers=[("If-None-Match", '"old"')])[0], 200)
+
+    def slow_fetch(self, change):
+        f = Path(self.www, "change.bin")
+        f.write_bytes(b"A" * 8_000_000)
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        s.connect(("127.0.0.1", self.s.port))
+        s.settimeout(5)
+        s.sendall(b"GET /change.bin HTTP/1.1\r\n" + H + b"\r\n")
+        out = s.recv(1024)
+        time.sleep(0.3)
+        change(str(f))
+        end = "OPEN"
+        try:
+            while True:
+                d = s.recv(1 << 20)
+                if not d:
+                    end = "EOF"
+                    break
+                out += d
+        except socket.timeout:
+            pass
+        except ConnectionError:
+            end = "RST"
+        s.close()
+        return len(out) - out.index(b"\r\n\r\n") - 4, end
+
+    def test_file_shrinks_while_sending(self):
+        # 예전 구현의 결함: 약속보다 적게 보내고 연결을 안 닫아 클라이언트가 무한 대기
+        n, end = self.slow_fetch(lambda f: os.truncate(f, 1_000_000))
+        self.assertLess(n, 8_000_000)
+        self.assertIn(end, ("EOF", "RST"))
+
+    def test_file_grows_while_sending(self):
+        # 예전 구현의 결함: 늘어난 만큼 더 보내 다음 응답과 섞임
+        def grow(f):
+            with open(f, "ab") as g:
+                g.write(b"HTTP/1.1 200 INJECTED\r\n" * 50000)
+        self.assertEqual(self.slow_fetch(grow)[0], 8_000_000)
+
+    def test_many_clients_get_their_own_file(self):
+        for i in range(20):
+            Path(self.www, f"f{i}").write_bytes(bytes([i]) * (200_000 + i))
+        bad = []
+
+        def one(i):
+            for _ in range(5):
+                st, _, body, _ = self.s.get(f"/f{i}", timeout=20)
+                if st != 200 or body != bytes([i]) * (200_000 + i):
+                    bad.append(i)
+        ts = [threading.Thread(target=one, args=(i % 20,)) for i in range(40)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(bad, [])
+
+# ---- 리버스 프록시 ----
+
+class Backend:
+    """바이트 단위로 조종하는 가짜 백엔드. script(sock, head, body)가 응답을 직접 쓴다"""
+
+    def __init__(self, script, port=0, backlog=128):
+        self.script, self.requests, self.connections = script, [], 0
+        self.open = True
+        self.ls = socket.socket()
+        self.ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.ls.bind(("127.0.0.1", port))
+        self.ls.listen(backlog)
+        self.port = self.ls.getsockname()[1]
+        self.socks = []
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while True:
+            try:
+                s, _ = self.ls.accept()
+            except OSError:
+                return
+            self.socks.append(s)
+            threading.Thread(target=self.serve, args=(s,), daemon=True).start()
+
+    def serve(self, s):
+        buf = b""
+        counted = False
+        try:
+            while True:
+                while b"\r\n\r\n" not in buf:
+                    d = s.recv(65536)
+                    if not d:
+                        return
+                    buf += d
+                if not counted:
+                    counted = True
+                    self.connections += 1
+                i = buf.index(b"\r\n\r\n") + 4
+                head, buf = buf[:i], buf[i:]
+                if head.startswith(b"GET /health "):
+                    s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    continue
+                m = re.search(rb"(?i)content-length: (\d+)", head)
+                n = int(m.group(1)) if m else 0
+                if not getattr(self.script, "early", False):
+                    while len(buf) < n:
+                        d = s.recv(1 << 20)
+                        if not d:
+                            return
+                        buf += d
+                body, buf = buf[:n], buf[n:]
+                self.requests.append((head, body))
+                if self.script(s, head, body) is False:
+                    return
+        except OSError:
+            pass
+        finally:
+            s.close()
+
+    def stop(self):
+        # Linux에서는 다른 스레드가 accept·recv 중이면 close만으로 닫히지 않는다. shutdown으로 먼저 깨운다
+        for s in [self.ls, *self.socks]:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            s.close()
+
+
+def ok(body=b"ok", extra=b""):
+    data = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n%s\r\n" % (len(body), extra) + body
+    return lambda s, head, b: s.sendall(data)
+
+
+def send(*parts, close=False, delay=0):
+    def script(s, head, body):
+        for x in parts:
+            s.sendall(x)
+            time.sleep(delay)
+        return not close
+    return script
+
+
+class ProxyCase(unittest.TestCase):
+    """테스트마다 백엔드와 서버를 새로 띄운다"""
+    extra = ""
+
+    def up(self, *scripts, pool="", extra="", route="route * / proxy p\n"):
+        self.b = [x if isinstance(x, Backend) else Backend(x) for x in scripts]
+        addrs = " ".join(f"127.0.0.1:{b.port}" for b in self.b)
+        self.s = Server(f"pool p {pool} {addrs}\n{route}health_interval 200ms\n{self.extra}{extra}")
+        return self.s
+
+    def tearDown(self):
+        for b in getattr(self, "b", []):
+            b.stop()
+        if hasattr(self, "s"):
+            self.s.stop()
+
+
+class ProxyRelay(ProxyCase):
+    def test_request_is_rewritten(self):
+        s = self.up(ok())
+        s.raw(b"POST //a/./b?q=%20 HTTP/1.1\r\nHost: Ex.com:99\r\nConnection: X-Drop, keep-alive\r\nX-Drop: 1\r\nKeep-Alive: 5\r\n"
+              b"X-Forwarded-For: 6.6.6.6\r\nTE: trailers\r\nUpgrade: h2c\r\nX-Keep: yes\r\nTransfer-Encoding: chunked\r\n\r\n"
+              b"3\r\nabc\r\n0\r\n\r\n", timeout=0.5)
+        head, body = self.b[0].requests[0]
+        h = head.decode()
+        self.assertTrue(h.startswith("POST /a/b?q=%20 HTTP/1.1\r\nHost: Ex.com:99\r\n"), h)
+        self.assertEqual(body, b"abc")
+        for gone in ("X-Drop", "Keep-Alive", "6.6.6.6", "TE:", "Upgrade", "chunked"):
+            self.assertNotIn(gone, h)
+        for there in ("X-Keep: yes", "X-Forwarded-For: 127.0.0.1", "Via: 1.1 jiho-webserver-", "Content-Length: 3"):
+            self.assertIn(there, h)
+
+    def test_response_framings(self):
+        cases = {
+            b"/len": b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+            b"/chunk": b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3;x=1\r\nllo\r\n0\r\nT: 1\r\n\r\n",
+            # 예전 구현의 결함: 둘 다 오면 둘 다 넘겼다
+            b"/both": b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            b"/eof": b"HTTP/1.1 200 OK\r\n\r\nhello",
+        }
+
+        def script(sock, head, body):
+            path = head.split()[1]
+            sock.sendall(cases[path])
+            return path != b"/eof"
+        s = self.up(script)
+        for path in cases:
+            st, h, body, end = s.get(path.decode())
+            self.assertEqual((st, body, end), (200, b"hello", "EOF"), path)
+            self.assertEqual("content-length" in h, path == b"/len", path)
+            # HTTP/1.0 클라이언트에게는 chunked를 보내면 안 된다
+            out, _ = s.raw(b"GET " + path + b" HTTP/1.0\r\n\r\n")
+            self.assertNotIn(b"chunked", out)
+            self.assertTrue(out.endswith(b"\r\n\r\nhello"), out)
+            self.assertEqual(s.get(path.decode(), method="HEAD")[2], b"", path)  # 길이를 몰라도 HEAD에는 본문도 끝 조각도 없다
+
+    def test_no_body_statuses_keep_the_connection_clean(self):
+        def script(sock, head, body):
+            p = head.split()[1]
+            sock.sendall({b"/204": b"HTTP/1.1 204 No Content\r\n\r\n", b"/304": b"HTTP/1.1 304 Not Modified\r\nETag: \"a\"\r\n\r\n",
+                          b"/head": b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n"}.get(p) or b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        s = self.up(script)
+        out, end = s.raw(b"GET /204 HTTP/1.1\r\n" + H + b"\r\n" + b"GET /304 HTTP/1.1\r\n" + H + b"\r\n" +
+                         b"HEAD /head HTTP/1.1\r\n" + H + b"\r\n" + b"GET /z HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        self.assertEqual((statuses(out), end), ([204, 304, 200, 200], "EOF"))
+        self.assertIn(b"Content-Length: 1000", out)
+        self.assertEqual(self.b[0].connections, 2)  # HEAD 뒤에만 새 연결, 나머지는 다시 썼다
+
+    def test_interim_responses(self):
+        # 예전 구현의 결함: 103을 최종 응답으로 보고 진짜 200을 버렸다
+        s = self.up(send(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\n",
+                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", delay=0.05))
+        out, _ = s.raw(b"GET / HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        self.assertEqual(statuses(out), [103, 200])
+        self.assertTrue(out.endswith(b"ok"))
+        self.assertEqual(statuses(s.raw(b"GET / HTTP/1.0\r\n\r\n")[0]), [200])
+
+    def test_bad_responses_become_502(self):
+        bad = [b"garbage\r\n\r\n", b"HTTP/1.1 200 OK\nContent-Length: 0\n\n", b"HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n",
+               b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n", b"HTTP/1.1 101 Switching\r\n\r\n",
+               b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+               b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+               b"HTTP/1.1 200 OK\r\nX: " + b"a" * 30000 + b"\r\n\r\n", b"HTTP/1.1 200"]
+        for data in bad:
+            b = Backend(send(data, close=True))
+            s = Server(f"pool p 127.0.0.1:{b.port}\nroute * / proxy p\n")
+            try:
+                st, _, _, end = s.get("/")
+                self.assertEqual((st, end), (502, "EOF"), data[:50])
+            finally:
+                s.stop()
+                b.stop()
+
+    def test_truncated_bodies_cut_the_client(self):
+        for data in (b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort",
+                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n",
+                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"):
+            b = Backend(send(data, close=True))
+            s = Server(f"pool p 127.0.0.1:{b.port}\nroute * / proxy p\n")
+            try:
+                out, end = s.raw(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+                self.assertIn(end, ("EOF", "RST"))
+                self.assertNotIn(b"\r\n0\r\n\r\n", out)  # 정상으로 끝난 척하면 안 된다
+                out, end = s.raw(b"GET / HTTP/1.0\r\n\r\n")
+                if b"chunked" in data:  # 1.0에는 닫힘이 끝이라는 뜻이므로 RST로 알려야 한다
+                    self.assertEqual(end, "RST")
+            finally:
+                s.stop()
+                b.stop()
+
+    def test_early_error_while_uploading(self):
+        def script(sock, head, body):
+            sock.sendall(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbig")
+            return False
+        script.early = True
+        s = self.up(script)
+        st, _, body, _ = s.get("/", method="POST", body=b"x" * 5_000_000)
+        self.assertEqual((st, body), (413, b"big"))
+
+    def test_reset_while_reading_until_close_is_not_a_complete_answer(self):
+        def script(sock, head, body):
+            sock.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial")
+            time.sleep(0.2)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\1\0\0\0\0\0\0\0")
+            return False
+        s = self.up(script)
+        out, end = s.raw(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+        self.assertNotIn(b"\r\n0\r\n\r\n", out)
+        self.assertNotEqual(end, "OPEN")
+        self.assertEqual(s.raw(b"GET / HTTP/1.0\r\n\r\n")[1], "RST")
+
+    def test_late_body_of_head_does_not_reach_anyone(self):
+        def script(sock, head, body):
+            if head.startswith(b"HEAD"):
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                time.sleep(0.02)
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nFAKE")
+            else:
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal")
+        s = self.up(script, extra="loops 1\n")
+        out, _ = s.raw(b"HEAD /h HTTP/1.1\r\n" + H + b"\r\n" + (b"GET /a HTTP/1.1\r\n" + H + b"\r\n") * 3 + b"GET /z HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        self.assertEqual((out.count(b"real"), out.count(b"FAKE")), (4, 0))
+
+    def test_leftover_bytes_do_not_reach_the_next_client(self):
+        n = [0]
+
+        def script(sock, head, body):
+            n[0] += 1
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL")
+        s = self.up(script)
+        for _ in range(5):
+            self.assertEqual(s.get("/")[2], b"ok")
+
+    def test_big_relay_with_slow_client_uses_little_memory(self):
+        size = 200 << 20
+
+        def script(sock, head, body):
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % size)
+            block = b"z" * (1 << 20)
+            for _ in range(size >> 20):
+                sock.sendall(block)
+        s = self.up(script)
+        c = socket.create_connection(("127.0.0.1", s.port))
+        c.sendall(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+        c.recv(1000)
+        time.sleep(1)  # 읽지 않고 버틴다
+        rss = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(s.p.pid)]))
+        got = 0
+        c.settimeout(10)
+        while got < size - 2000:
+            got += len(c.recv(1 << 20))
+        c.close()
+        if "asan" not in BIN and "tsan" not in BIN:
+            self.assertLess(rss, 30_000, "KB")
+
+    def test_backend_that_sends_head_and_body_apart_is_not_slow(self):
+        # Linux에서 요청마다 40ms씩 늦던 문제 (확인 응답 미루기)
+        s = self.up(send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", b"ok"), extra="loops 1\n")
+        c = socket.create_connection(("127.0.0.1", s.port))
+        c.settimeout(5)
+        t = time.time()
+        for _ in range(40):
+            c.sendall(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+            out = b""
+            while not out.endswith(b"ok"):
+                out += c.recv(4096)
+        c.close()
+        self.assertLess(time.time() - t, 0.8)
+
+    def test_post_bodies(self):
+        # 길이를 적지 않는 백엔드 → 클라이언트에게는 chunked로 나간다
+        s = self.up(lambda sock, head, body: sock.sendall(b"HTTP/1.1 200 OK\r\n\r\n" + body) or False)
+        for size in (0, 5, 70_000, 3_000_000):  # 64KB를 넘으면 임시 파일에 모았다가 보낸다
+            data = os.urandom(size)
+            self.assertEqual(s.get("/", method="POST", body=data, timeout=10)[2], data)
+
+    def test_concurrent_bodies_do_not_mix(self):
+        s = self.up(lambda sock, head, body: sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body),
+                    lambda sock, head, body: sock.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n" % len(body) + body + b"\r\n0\r\n\r\n"))
+        bad = []
+
+        def one(i):
+            body = bytes([i]) * (1000 * i + 1)
+            for _ in range(10):
+                st, _, got, _ = s.get("/", method="POST", body=body, timeout=20)
+                if st != 200 or got != body:
+                    bad.append((i, st, len(got)))
+        ts = [threading.Thread(target=one, args=(i,)) for i in range(1, 41)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(bad, [])
+
+    def test_loop_is_detected(self):
+        s = Server("pool me 127.0.0.1:@PORT@\nroute * / proxy me\n")
+        try:
+            self.assertEqual(s.get("/")[0], 508)
+        finally:
+            s.stop()
+
+
+class ProxyFailure(ProxyCase):
+    extra = "timeout_response 600ms\ntimeout_stall 600ms\n"
+
+    def test_balances(self):
+        for policy in ("least_conn", "round_robin"):
+            s = self.up(ok(b"A"), ok(b"B"), pool=policy)
+            got = [s.get("/")[2] for _ in range(10)]
+            self.assertEqual((got.count(b"A"), got.count(b"B")), (5, 5), policy)
+            self.tearDown()
+            del self.s
+
+    def test_least_conn_avoids_the_busy_one(self):
+        s = self.up(lambda sock, h, b: (time.sleep(0.5), sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nslow"))[1], ok(b"fast"))
+        ts = [threading.Thread(target=s.get, args=("/",)) for _ in range(2)]
+        [t.start() for t in ts]
+        time.sleep(0.1)
+        got = [s.get("/")[2] for _ in range(10)]
+        [t.join() for t in ts]
+        self.assertGreaterEqual(got.count(b"fast"), 9)
+
+    def test_dead_backend_is_invisible_to_clients(self):
+        # 예전 구현의 결함: 2대 중 1대가 죽으면 절반이 502
+        s = self.up(ok(b"A"), ok(b"B"))
+        port = self.b[1].port
+        self.b[1].stop()
+        self.assertEqual([s.get("/")[0] for _ in range(20)], [200] * 20)
+        self.assertEqual([s.get("/", method="POST", body=b"x")[0] for _ in range(20)], [200] * 20)
+        self.b[1] = Backend(ok(b"B"), port=port)  # 되살아나면 저절로 돌아온다
+        end = time.time() + 5
+        while time.time() < end and s.get("/")[2] != b"B":
+            time.sleep(0.1)
+        self.assertLess(time.time(), end)
+
+    def test_all_dead_is_502_not_hang(self):
+        s = self.up(ok(), ok())
+        for b in self.b:
+            b.stop()
+        t = time.time()
+        self.assertEqual(s.get("/")[0], 502)
+        self.assertLess(time.time() - t, 2)
+
+    def test_hang_is_504_and_does_not_exclude(self):
+        def script(sock, head, body):
+            if head.startswith(b"GET /hang"):
+                time.sleep(3)
+                return False
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        s = self.up(script)
+        self.assertEqual([s.get("/hang")[0] for _ in range(6)], [504] * 6)
+        self.assertEqual(s.get("/")[0], 200)
+
+    def test_header_drip_from_backend_is_504(self):
+        def script(sock, head, body):
+            for ch in b"HTTP/1.1 200 OK\r\nX: " + b"a" * 100:
+                sock.sendall(bytes([ch]))
+                time.sleep(0.1)
+        s = self.up(script)
+        t = time.time()
+        self.assertEqual(s.get("/")[0], 504)
+        self.assertLess(time.time() - t, 2)
+
+    def test_posts_survive_a_backend_that_closes_silently(self):
+        def script(sock, head, body):
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            return False
+        s = self.up(script, extra="loops 1\n")
+        bad = []
+
+        def one():
+            for _ in range(30):
+                if s.get("/", method="POST", body=b"x")[0] != 200:
+                    bad.append(1)
+        ts = [threading.Thread(target=one) for _ in range(8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(bad, [])
+
+    def test_stall_in_body_cuts(self):
+        s = self.up(send(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc", b"", delay=2))
+        t = time.time()
+        out, end = s.raw(b"GET / HTTP/1.1\r\n" + H + b"\r\n", timeout=5)
+        self.assertIn(end, ("EOF", "RST"))
+        self.assertLess(time.time() - t, 2)
+
+    def test_post_is_never_sent_twice(self):
+        s = self.up(lambda *a: False, lambda *a: False)
+        self.assertEqual(s.get("/", method="POST", body=b"pay")[0], 502)
+        self.assertEqual(sum(len(b.requests) for b in self.b), 1)
+        self.assertEqual(s.get("/")[0], 502)  # GET은 다른 백엔드로 한 번 더
+        self.assertEqual(sum(len(b.requests) for b in self.b), 3)
+
+    def test_get_moves_to_the_other_backend(self):
+        s = self.up(lambda *a: False, ok(b"B"), pool="round_robin")
+        self.assertEqual([s.get("/")[2] for _ in range(6)], [b"B"] * 6)
+
+    def test_always_503_backend_gets_excluded(self):
+        # 즉시 503만 주는 백엔드는 가장 한가해 보여서 least_conn이 몰아준다
+        s = self.up(send(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"), ok(b"B"))
+        got = [s.get("/")[0] for _ in range(40)]
+        self.assertLessEqual(got.count(503), 6)
+        self.assertEqual(got[-20:], [200] * 20)
+
+    def test_500_does_not_exclude(self):
+        s = self.up(send(b"HTTP/1.1 500 x\r\nContent-Length: 0\r\n\r\n"), ok(b"B"), pool="round_robin")
+        got = [s.get("/")[0] for _ in range(30)]
+        self.assertEqual(got.count(500), 15)
+
+    def test_in_flight_limit(self):
+        gate = threading.Event()
+
+        def script(sock, head, body):
+            gate.wait(5)
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        s = self.up(script, pool="max=2", extra="timeout_response 10s\n")
+        res = []
+        ts = [threading.Thread(target=lambda: res.append(s.get("/", timeout=10)[0])) for _ in range(2)]
+        [t.start() for t in ts]
+        time.sleep(0.3)
+        st, h, _, _ = s.get("/")
+        self.assertEqual((st, h["retry-after"]), (503, "1"))
+        gate.set()
+        [t.join() for t in ts]
+        self.assertEqual(res, [200, 200])
+        self.assertEqual(s.get("/")[0], 200)
+
+    def test_stale_pooled_connection(self):
+        # 응답 직후 말없이 닫는 백엔드. 다시 쓰려다 실패해도 손님에게는 안 보여야 한다
+        def script(sock, head, body):
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            return False
+        s = self.up(script)
+        self.assertEqual([s.get("/")[0] for _ in range(30)], [200] * 30)
+
+    def test_frozen_backend_is_found_by_health_check(self):
+        # 프로세스가 멈춰도 handshake는 커널이 끝내므로 연결은 성공한다. 헬스 체크만 알아챌 수 있다
+        ports = [free_port(), free_port()]
+        ps = [subprocess.Popen([sys.executable, str(ROOT / "tests/backend.py"), str(p)], stdout=subprocess.DEVNULL) for p in ports]
+        try:
+            time.sleep(1)
+            s = self.s = Server(f"pool p health=/health 127.0.0.1:{ports[0]} 127.0.0.1:{ports[1]}\nroute * / proxy p\nhealth_interval 200ms\n{self.extra}")
+            self.b = []
+            ps[1].send_signal(signal.SIGSTOP)
+            time.sleep(4)
+            t = time.time()
+            self.assertEqual([s.get("/")[0] for _ in range(10)], [200] * 10)
+            self.assertLess(time.time() - t, 1)
+            ps[1].send_signal(signal.SIGCONT)
+        finally:
+            for p in ps:
+                p.send_signal(signal.SIGCONT)
+                p.kill()
+                p.wait()
+
+    def test_client_leaving_frees_the_backend(self):
+        s = self.up(lambda sock, h, b: time.sleep(1.5) or sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"), pool="max=1",
+                    extra="timeout_response 10s\n")
+        c = socket.create_connection(("127.0.0.1", s.port))
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\1\0\0\0\0\0\0\0")
+        c.sendall(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+        time.sleep(0.2)
+        self.assertEqual(s.get("/")[0], 503)
+        c.close()  # RST
+        time.sleep(0.2)
+        self.assertEqual(s.get("/")[0], 200)
+
+# ---- 캐시 ----
+
+class Cache(ProxyCase):
+    def start(self, extra=b"Cache-Control: max-age=60\r\n", body=b"v%d", pool=""):
+        self.n = 0
+
+        def script(sock, head, b):
+            self.n += 1
+            data = (body % self.n) if b"%d" in body else body
+            sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n" % len(data) + extra + b"\r\n" + data)
+        return self.up(script, route="route * / proxy p cache\n", pool=pool)
+
+    def test_hit_miss_and_age(self):
+        s = self.start(b'Cache-Control: max-age=60\r\nAge: 5\r\nETag: "e"\r\n')
+        st, h, body, _ = s.get("/a?x")
+        self.assertEqual((h["x-cache"], body), ("MISS", b"v1"))
+        st, h, body, _ = s.get("/a?x")
+        self.assertEqual((h["x-cache"], h["age"], body), ("HIT", "5", b"v1"))
+        st, h, body, _ = s.get("/a?x", method="HEAD")
+        self.assertEqual((h["x-cache"], h["content-length"], body), ("HIT", "2", b""))
+        st, h, body, _ = s.get("/a?x", headers=[("If-None-Match", '"e"')])
+        self.assertEqual((st, body), (304, b""))
+        self.assertEqual(s.get("/a?y")[1]["x-cache"], "MISS")           # 쿼리가 다르면 다른 것
+        self.assertEqual(s.get("/a?x", host="other")[1]["x-cache"], "MISS")  # 호스트가 다르면 다른 것
+        for h in (("Cookie", "a=b"), ("Authorization", "x"), ("Cache-Control", "no-cache"), ("Range", "bytes=0-0")):
+            self.assertEqual(s.get("/a?x", headers=[h])[1]["x-cache"], "MISS", h)
+        self.assertEqual(s.get("/a?x", method="POST", body=b"z")[0], 200)  # 값을 바꾸는 요청이 성공하면 지운다
+        self.assertEqual(s.get("/a?x")[1]["x-cache"], "MISS")
+
+    def test_cookie_exception_is_per_route(self):
+        self.n = 0
+
+        def script(sock, head, b):
+            self.n += 1
+            data = b"v%d" % self.n
+            sock.sendall(b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: %d\r\n\r\n" % len(data) + data)
+        s = self.up(script, route="route * /open proxy p cache cookies\nroute * / proxy p cache\n")
+        ck = [("Cookie", "session=1")]
+        self.assertEqual([s.get("/open", headers=ck)[1]["x-cache"] for _ in range(2)], ["MISS", "HIT"])
+        self.assertEqual([s.get("/shut", headers=ck)[1]["x-cache"] for _ in range(2)], ["MISS", "MISS"])
+        self.assertEqual(s.get("/open", headers=ck + [("Authorization", "x")])[1]["x-cache"], "MISS")
+        for path in ("/open", "/shut"):  # 쿠키가 있어도 지우기는 항상 한다 (수정은 보통 로그인한 사람이 한다)
+            s.get(path)
+            self.assertEqual(s.get(path)[1]["x-cache"], "HIT")
+            s.get(path, method="PUT", headers=ck, body=b"x")
+            self.assertEqual(s.get(path)[1]["x-cache"], "MISS")
+
+    def test_private_responses_are_never_stored(self):
+        for extra in (b"", b"Cache-Control: private, max-age=60\r\n", b"Cache-Control: max-age=60\r\nSet-Cookie: s=1\r\n",
+                      b"Cache-Control: max-age=60\r\nVary: Cookie\r\n", b"Cache-Control: no-store\r\n"):
+            s = self.start(extra)
+            self.assertEqual([s.get("/")[2] for _ in range(3)], [b"v1", b"v2", b"v3"], extra)
+            self.tearDown()
+            del self.s
+
+    def test_expires(self):
+        s = self.start(b"Cache-Control: max-age=1\r\n")
+        self.assertEqual([s.get("/")[2] for _ in range(3)], [b"v1"] * 3)
+        time.sleep(1.1)
+        self.assertEqual(s.get("/")[2], b"v2")
+
+    def test_truncated_and_big_are_not_stored(self):
+        self.n = 0
+
+        def script(sock, head, b):
+            self.n += 1
+            if b"/cut" in head:
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nCache-Control: max-age=60\r\n\r\nabc")
+                return False
+            data = b"x" * 2_000_000
+            sock.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nCache-Control: max-age=60\r\n\r\n%x\r\n" % len(data) + data + b"\r\n0\r\n\r\n")
+        s = self.up(script, route="route * / proxy p cache\n")
+        for path, size in (("/cut", None), ("/big", 2_000_000)):
+            self.n = 0
+            for _ in range(2):
+                out, _ = s.raw(f"GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+                self.assertIn(b"X-Cache: MISS", out)
+                if size:
+                    self.assertEqual(len(parse(out)[2]), size)
+            self.assertEqual(self.n, 2)
+
+    def test_many_readers_and_writers(self):
+        s = self.start(b"Cache-Control: max-age=60\r\n", b"z" * 300_000)
+        bad = []
+
+        def one(i):
+            for k in range(30):
+                if i % 4 == 0 and k % 3 == 0:
+                    s.get(f"/{k % 5}", method="POST", body=b"x")
+                elif s.get(f"/{k % 5}", timeout=20)[2] != b"z" * 300_000:
+                    bad.append((i, k))
+        ts = [threading.Thread(target=one, args=(i,)) for i in range(16)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(bad, [])
+
+    def test_get_with_a_body_cannot_poison(self):
+        s = self.up(lambda sock, h, b: sock.sendall(b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: %d\r\n\r\n" % len(b) + b), route="route * / proxy p cache\n")
+        s.get("/p", body=b"evil")
+        self.assertEqual(s.get("/p")[2], b"")
+
+    def test_old_answer_is_not_stored_after_a_change(self):
+        state = {"v": b"v1"}
+
+        def script(sock, head, body):
+            if head.startswith(b"POST"):
+                state["v"] = b"v2"
+                sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                return
+            v = state["v"]
+            if b"X-Slow" in head:
+                time.sleep(0.5)
+            sock.sendall(b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 2\r\n\r\n" + v)
+        s = self.up(script, route="route * / proxy p cache\n")
+        t = threading.Thread(target=lambda: s.get("/a", headers=[("X-Slow", "1")]))
+        t.start()
+        time.sleep(0.2)
+        s.get("/a", method="POST", body=b"x")
+        t.join()
+        self.assertEqual(s.get("/a")[2], b"v2")
+
+    def test_survives_dead_backend(self):
+        s = self.start()
+        s.get("/a")
+        self.b[0].stop()
+        self.assertEqual((s.get("/a")[0], s.get("/b")[0]), (200, 502))
+
+
+# ---- 상태 페이지, 로그 ----
+
+class Observe(Case):
+    @classmethod
+    def files(cls, d):
+        Path(d, "index.html").write_text("hello")
+
+    def test_status_page_only_on_admin_port(self):
+        self.assertEqual(self.s.get("/status.json")[0], 404)
+        out, _ = self.s.raw(b"GET /status.json HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n", port=self.s.admin)
+        import json
+        st, _, body = parse(out)
+        j = json.loads(body)
+        self.assertEqual((st, len(j["loops"])), (200, 3))
+        self.assertEqual(statuses(self.s.raw(b"GET / HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n", port=self.s.admin)[0]), [200])
+        self.assertEqual(statuses(self.s.raw(b"POST / HTTP/1.1\r\n" + H + b"Content-Length: 0\r\nConnection: close\r\n\r\n", port=self.s.admin)[0]), [405])
+
+    def test_connections_are_spread_over_loops(self):
+        import json
+        for _ in range(30):
+            self.s.get("/")
+        out, _ = self.s.raw(b"GET /status.json HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n", port=self.s.admin)
+        got = [x["accepted"] for x in json.loads(parse(out)[2])["loops"]]
+        self.assertGreater(min(got), 5, got)
+
+    def test_access_log(self):
+        self.s.get("/index.html?token=secret")
+        self.s.raw(b"garbage\r\n\r\n")
+        time.sleep(0.5)
+        log = Path(self.s.dir, "access.log").read_text()
+        self.assertRegex(log, r'127\.0\.0\.1 "GET /index.html" 200 5 \d+ms')
+        self.assertIn(" 400 ", log)
+        self.assertNotIn("secret", log)
+
+    def test_blocked_log_does_not_block_the_server(self):
+        r, w = os.pipe()
+        port = free_port()
+        p = subprocess.Popen([BIN, "-p", str(port), "-r", self.www, "-t", "1"], stderr=w)
+        os.close(w)
+        one = b"GET /index.html HTTP/1.1\r\n" + H + b"\r\n"
+
+        def burst(c, n):
+            c.sendall(one * n)
+            got = 0
+            while got < n:
+                got += c.recv(1 << 20).count(b"200 OK")
+        try:
+            time.sleep(0.5)
+            c = socket.create_connection(("127.0.0.1", port))
+            c.settimeout(5)
+            for _ in range(60):  # 로그를 읽지 않는 파이프가 꽉 차도 응답은 계속 나와야 한다
+                burst(c, 50)
+            os.read(r, 4096)  # 조금만 읽고 다시 멈춰도 마찬가지 (한 번에 크게 쓰면 여기서 잠든다)
+            for _ in range(10):
+                burst(c, 50)
+            c.close()
+            p.terminate()
+            self.assertEqual(p.wait(5), 0)  # sanitizer가 무언가 찾았으면 0이 아니다
+        finally:
+            os.close(r)
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
+
+# ---- 과부하, 제한 시간, 종료 ----
+
+class Limits(unittest.TestCase):
+    def serve(self, conf="", **kw):
+        self.www = tempfile.mkdtemp(prefix="webserver-www-")
+        Path(self.www, "index.html").write_text("hello")
+        Path(self.www, "big").write_bytes(b"x" * (30 << 20))
+        self.s = Server(f"route * / static {self.www}\n" + conf, **kw)
+        return self.s
+
+    def tearDown(self):
+        shutil.rmtree(self.www, ignore_errors=True)
+        if self.s.p.poll() is None:
+            self.s.stop()
+
+    def connect(self, data=b"", rcvbuf=0):
+        c = socket.socket()
+        if rcvbuf:
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        c.connect(("127.0.0.1", self.s.port))
+        c.settimeout(5)
+        if data:
+            c.sendall(data)
+        return c
+
+    def test_header_drip_gets_408(self):
+        s = self.serve("timeout_head 800ms\n")
+        c = self.connect(b"GET / HTTP/1.1\r\n")
+        t = time.time()
+        try:
+            while time.time() - t < 4:  # 0.2초마다 1바이트. 바이트마다 연장되면 끝나지 않는다
+                c.sendall(b"X")
+                time.sleep(0.2)
+                c.setblocking(False)
+                try:
+                    if c.recv(100).startswith(b"HTTP/1.1 408"):
+                        break
+                except BlockingIOError:
+                    pass
+                c.setblocking(True)
+        except OSError:
+            pass
+        self.assertLess(time.time() - t, 2)
+        c.close()
+
+    def test_silent_connection_is_closed(self):
+        self.serve("timeout_head 500ms\n")
+        c = self.connect()
+        t = time.time()
+        self.assertEqual(c.recv(10), b"")
+        self.assertLess(time.time() - t, 2)
+
+    def test_idle_keep_alive_is_closed(self):
+        self.serve("timeout_idle 500ms\n")
+        c = self.connect(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+        self.assertIn(b"hello", c.recv(4096))
+        t = time.time()
+        self.assertEqual(c.recv(10), b"")
+        self.assertLess(time.time() - t, 2)
+
+    def test_slow_body_gets_408(self):
+        b = Backend(ok())
+        self.serve(f"timeout_head 600ms\npool p 127.0.0.1:{b.port}\nroute * /up proxy p\n")
+        c = self.connect(b"POST /up HTTP/1.1\r\n" + H + b"Content-Length: 1000\r\n\r\nabc")
+        self.assertIn(b"408", c.recv(100))
+        self.assertEqual(b.requests, [])  # 느린 업로드는 백엔드에 닿지도 않는다
+        b.stop()
+
+    def test_upload_that_stops_gives_the_disk_back(self):
+        import json
+        b = Backend(ok())
+        s = self.serve(f"timeout_head 600ms\nmax_upload_disk 4m\npool p 127.0.0.1:{b.port}\nroute * /up proxy p\n")
+        c = self.connect(b"POST /up HTTP/1.1\r\n" + H + b"Content-Length: 4194304\r\n\r\n" + b"x" * 3_900_000)
+        time.sleep(0.2)
+        self.assertEqual(s.get("/up", method="POST", body=b"y" * 400_000)[0], 503)
+        time.sleep(1.5)  # 빨리 보내 벌어 둔 시간은 멈춘 순간 소용이 없어야 한다
+        self.assertEqual(s.get("/up", method="POST", body=b"y" * 400_000)[0], 200)
+        c.close()
+        b.stop()
+
+    def test_moving_upload_is_not_evicted(self):
+        b = Backend(ok())
+        s = self.serve(f"max_connections 2\nloops 1\npool p 127.0.0.1:{b.port}\nroute * /up proxy p\n")
+        res = []
+
+        def upload():
+            c = socket.create_connection(("127.0.0.1", s.port))
+            c.settimeout(10)
+            try:
+                c.sendall(b"POST /up HTTP/1.1\r\n" + H + b"Content-Length: 2000000\r\nConnection: close\r\n\r\n")
+                for _ in range(20):
+                    c.sendall(b"z" * 100_000)
+                    time.sleep(0.05)
+                res.append(c.recv(12))
+            except OSError as e:
+                res.append(e)
+        ts = [threading.Thread(target=upload) for _ in range(2)]
+        [t.start() for t in ts]
+        time.sleep(0.4)
+        self.assertEqual(s.get("/")[0], 503)
+        [t.join() for t in ts]
+        self.assertEqual(res, [b"HTTP/1.1 200"] * 2)
+        b.stop()
+
+    def test_requests_already_in_the_queue_survive_sigterm(self):
+        s = self.serve()
+        s.p.send_signal(signal.SIGSTOP)
+        cs = [self.connect(b"GET / HTTP/1.1\r\n" + H + b"\r\n") for _ in range(100)]
+        s.p.send_signal(signal.SIGTERM)
+        s.p.send_signal(signal.SIGCONT)
+        ok_ = 0
+        for c in cs:
+            try:
+                ok_ += c.recv(1000).startswith(b"HTTP/1.1 200")
+            except OSError:
+                pass
+            c.close()
+        self.assertEqual(ok_, 100)
+        s.stop()
+
+    def test_reader_that_stops_is_cut(self):
+        self.serve("timeout_stall 700ms\n")
+        c = self.connect(b"GET /big HTTP/1.1\r\n" + H + b"\r\n", rcvbuf=4096)
+        time.sleep(2)
+        n = 0
+        try:
+            while d := c.recv(1 << 20):
+                n += len(d)
+        except ConnectionError:
+            pass
+        self.assertLess(n, 30 << 20)
+
+    def test_silent_connections_over_the_limit_do_not_block_others(self):
+        # 예전 구현의 결함: 침묵 4개에 9.7초 대기, 68개면 503
+        s = self.serve("max_connections 300\n")
+        idle = [self.connect() for _ in range(300)]
+        idle += [self.connect(b"G") for _ in range(100)]  # 상한보다 100개 더
+        t = time.time()
+        for _ in range(30):
+            self.assertEqual(s.get("/")[0], 200)
+        self.assertLess(time.time() - t, 1.5)
+        for c in idle:
+            c.close()
+
+    def test_busy_connections_are_not_evicted(self):
+        s = self.serve("max_connections 3\nloops 1\n")
+        busy = [self.connect(b"GET /big HTTP/1.1\r\n" + H + b"\r\n", rcvbuf=4096) for _ in range(3)]
+        time.sleep(0.3)
+        self.assertEqual(s.get("/")[0], 503)
+        for c in busy:
+            c.close()
+        time.sleep(0.2)
+        self.assertEqual(s.get("/")[0], 200)
+
+    def test_finishes_in_flight_on_sigterm(self):
+        s = self.serve()
+        c = self.connect(b"GET /big HTTP/1.1\r\n" + H + b"\r\n", rcvbuf=65536)
+        idle = self.connect(b"GET / HTTP/1.1\r\n" + H + b"\r\n")
+        got = len(c.recv(1000))
+        first = b""
+        while not first.endswith(b"hello"):
+            first += idle.recv(4096)
+        s.p.send_signal(signal.SIGTERM)
+        time.sleep(0.5)
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", s.port), 1)
+        self.assertEqual(idle.recv(10), b"")  # 쉬던 연결은 바로 닫는다
+        while d := c.recv(1 << 20):
+            got += len(d)
+        self.assertGreater(got, 30 << 20)
+        c.close()
+        s.stop()
+
+    def test_drain_has_a_deadline_and_second_signal_is_immediate(self):
+        for second in (False, True):
+            s = self.serve(f"timeout_drain {'30s' if second else '500ms'}\n")
+            c = self.connect(b"GET /big HTTP/1.1\r\n" + H + b"\r\n", rcvbuf=4096)
+            time.sleep(0.2)
+            t = time.time()
+            s.p.send_signal(signal.SIGTERM)
+            if second:
+                time.sleep(0.3)
+                s.p.send_signal(signal.SIGINT)
+            s.p.wait(5)
+            self.assertLess(time.time() - t, 2.5)
+            c.close()
+            s.stop()
+
+    def test_clients_that_vanish(self):
+        s = self.serve()
+        before = len(os.listdir("/dev/fd"))
+        rst = b"\1\0\0\0\0\0\0\0"
+        for i in range(400):
+            c = self.connect([b"", b"GET", b"GET /big HTTP/1.1\r\n" + H + b"\r\n", b"POST / HTTP/1.1\r\n" + H + b"Content-Length: 9\r\n\r\nab"][i % 4])
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, rst)
+            c.close()
+        time.sleep(0.6)
+        self.assertEqual(s.get("/")[0], 200)
+        out = subprocess.run(["lsof", "-p", str(s.p.pid)], capture_output=True).stdout.decode()
+        self.assertLessEqual(len(re.findall(r"ESTABLISHED|CLOSE_WAIT", out)), 2, out)
+
+    def test_low_fd_limit_lowers_max_connections(self):
+        import resource
+        s = self.serve("max_connections 1000\n", preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (400, 400)))
+        self.assertIn("max_connections를", s.stderr())
+        cs = [self.connect() for _ in range(100)]
+        self.assertEqual(s.get("/")[0], 200)
+        for c in cs:
+            c.close()
+
+
+@unittest.skipUnless(os.environ.get("FAULT"), "고장 주입 빌드에서만 (make e2e가 켠다)")
+class Watchdog(unittest.TestCase):
+    """감독이 워커의 죽음과 멈춤을 알아채고 바꾸는지. 일부러 멈추거나 죽는 주소(/__fault/...)를 쓴다"""
+
+    def start(self, conf="", supervise=True):
+        self.d = tempfile.mkdtemp(prefix="webserver-dog-")
+        self.port = free_port()
+        path = Path(self.d, "c.conf")
+        path.write_text(f"listen 127.0.0.1:{self.port}\nloops 2\naccess_log off\ntimeout_drain 500ms\nroute * / static {ROOT}/www\n{conf}")
+        self.err = open(Path(self.d, "err"), "w+")
+        cmd = [str(ROOT / os.environ["FAULT"]), "-c", str(path)] + (["-s"] if supervise else [])
+        self.p = subprocess.Popen(cmd, stderr=self.err)
+        self.wait(lambda: self.get() == 200)
+
+    def tearDown(self):
+        if self.p.poll() is None:
+            self.p.kill()
+            self.p.wait()
+        self.err.close()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def text(self):
+        return Path(self.d, "err").read_text()
+
+    def get(self, path="/", timeout=1):
+        try:
+            c = socket.create_connection(("127.0.0.1", self.port), timeout)
+            c.settimeout(timeout)
+            c.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+            return int(c.recv(100).split()[1])
+        except (OSError, IndexError, ValueError):
+            return None
+
+    def wait(self, f, limit=15):
+        end = time.time() + limit
+        while time.time() < end:
+            if f():
+                return
+            time.sleep(0.05)
+        self.fail(self.text())
+
+    def workers(self):
+        return [int(x) for x in subprocess.run(["pgrep", "-P", str(self.p.pid)], capture_output=True).stdout.split()]
+
+    def test_hung_loop_is_replaced(self):
+        self.start()
+        old = self.workers()[0]
+        self.get("/__fault/hang", timeout=0.2)
+        self.wait(lambda: "소식이 없습니다" in self.text() and any(w != old for w in self.workers()))
+        self.wait(lambda: self.get() == 200)
+        self.assertIn("움직이지 않습니다", self.text())
+        self.wait(lambda: self.workers() and old not in self.workers())  # 멈춘 워커는 SIGTERM을 못 들어도 결국 사라진다
+        self.assertEqual([self.get() for _ in range(10)], [200] * 10)
+
+    def test_frozen_worker_is_replaced(self):
+        self.start()
+        old = self.workers()[0]
+        os.kill(old, signal.SIGSTOP)  # 메인까지 통째로 멈춤
+        self.wait(lambda: self.workers() and old not in self.workers())
+        self.wait(lambda: self.get() == 200)
+
+    def test_frozen_supervisor_does_not_misjudge(self):
+        # 감독과 워커가 같이 잠들었다 깨는 상황(노트북 덮기): 시간만 지났다고 바꾸면 안 된다
+        self.start()
+        w = self.workers()[0]
+        for pid in (self.p.pid, w):
+            os.kill(pid, signal.SIGSTOP)
+        time.sleep(5)
+        for pid in (w, self.p.pid):
+            os.kill(pid, signal.SIGCONT)
+        time.sleep(2)
+        self.assertEqual(self.workers(), [w])
+        self.assertEqual(self.get(), 200)
+
+    def test_watchdog_off(self):
+        self.start("watchdog off\n")
+        w = self.workers()[0]
+        os.kill(w, signal.SIGSTOP)
+        time.sleep(5)
+        self.assertEqual(self.workers(), [w])
+        os.kill(w, signal.SIGCONT)
+        self.wait(lambda: self.get() == 200)
+
+    def test_crash_leaves_a_record_and_comes_back(self):
+        self.start()
+        for what in ("crash", "segv", "trap"):  # abort, 잘못된 메모리 접근, 함정 명령
+            w = self.workers()[0]
+            self.get(f"/__fault/{what}?token=secret")
+            self.wait(lambda: self.workers() not in ([], [w]) and self.get() == 200, 6)
+            self.assertRegex(self.text(), rf"처리 중이던 요청: 루프 \d GET /__fault/{what}\n")
+        self.assertIn("죽었습니다(시그널", self.text())
+        self.assertNotIn("소식이 없습니다", self.text())  # 멈춤이 아니라 죽음으로 바로 알아챘다
+        self.assertNotIn("secret", self.text())
+
+    def test_crash_with_a_blocked_log_still_dies(self):
+        r, w = os.pipe()
+        os.set_blocking(w, False)
+        try:
+            while True:
+                os.write(w, b"x" * 512)
+        except BlockingIOError:
+            pass
+        os.set_blocking(w, True)
+        port = free_port()
+        p = subprocess.Popen([str(ROOT / os.environ["FAULT"]), "-p", str(port), "-r", f"{ROOT}/www"], stderr=w)
+        os.close(w)
+        try:
+            time.sleep(0.8)
+            c = socket.create_connection(("127.0.0.1", port), 2)
+            c.sendall(b"GET /__fault/crash HTTP/1.1\r\n" + H + b"\r\n")
+            self.assertLess(p.wait(5), 0)
+            c.close()
+        finally:
+            os.close(r)
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+        self.start()
+
+    def download(self):
+        c = socket.socket()
+        c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+        c.connect(("127.0.0.1", self.port))
+        c.settimeout(20)
+        c.sendall(b"GET /dl/big HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        return c, len(c.recv(1000))
+
+    def rest(self, c, got):
+        try:
+            while d := c.recv(1 << 20):
+                got += len(d)
+        except OSError:
+            pass
+        c.close()
+        return got
+
+    def prepare_download(self, conf):
+        d = tempfile.mkdtemp(prefix="webserver-dl-")
+        Path(d, "big").write_bytes(b"x" * (30 << 20))
+        self.addCleanup(shutil.rmtree, d, True)
+        return f"route * /dl static {d}\n" + conf
+
+    def test_signal_to_both_still_drains(self):
+        # pkill처럼 감독과 워커 모두에게 SIGTERM이 가도 "두 번째 = 당장"으로 오해하지 않는다
+        self.start(self.prepare_download("timeout_drain 20s\n"))
+        c, got = self.download()
+        for pid in (self.workers()[0], self.p.pid):
+            os.kill(pid, signal.SIGTERM)
+        time.sleep(1.5)
+        self.assertGreater(self.rest(c, got), 30 << 20)
+        self.assertEqual(self.p.wait(10), 0)
+
+    def test_second_stop_is_immediate(self):
+        self.start(self.prepare_download("timeout_drain 20s\n"))
+        c, _ = self.download()
+        t = time.time()
+        self.p.terminate()
+        time.sleep(0.4)
+        self.p.terminate()
+        self.p.wait(10)
+        self.assertLess(time.time() - t, 4)
+        c.close()
+
+    def test_draining_worker_is_not_mistaken_for_a_hung_one(self):
+        self.start(self.prepare_download("timeout_drain 20s\n"))
+        c, got = self.download()
+        w = self.workers()[0]
+        os.kill(w, signal.SIGTERM)  # 워커에게만. 마무리하는 동안에도 심장 박동은 이어진다
+        time.sleep(6)
+        self.assertNotIn("소식이 없습니다", self.text())
+        self.assertGreater(self.rest(c, got), 30 << 20)
+        self.wait(lambda: self.workers() not in ([], [w]) and self.get() == 200)
+
+    def reload(self, conf):
+        n = self.text().count("준비됨")
+        path = Path(self.d, "c.conf")
+        path.write_text(f"listen 127.0.0.1:{self.port}\nloops 2\naccess_log off\ntimeout_drain 500ms\nroute * / static {ROOT}/www\n{conf}")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: self.text().count("준비됨") > n)
+
+    def test_reload_also_changes_what_the_supervisor_uses(self):
+        self.start(self.prepare_download("timeout_drain 300ms\n"))
+        self.reload(self.prepare_download("timeout_drain 30s\nwatchdog off\n"))
+        c, got = self.download()
+        self.reload("")
+        time.sleep(7)  # 옛 값(0.3초 + 5초)이었다면 이미 강제로 끝났다
+        self.assertNotIn("강제로", self.text())
+        self.assertGreater(self.rest(c, got), 30 << 20)
+        w = self.workers()
+        self.reload("watchdog off\n")
+        self.wait(lambda: len(self.workers()) == 1 and self.workers() != w)
+        w = self.workers()[0]
+        os.kill(w, signal.SIGSTOP)
+        time.sleep(5)
+        self.assertEqual(self.workers(), [w])
+        os.kill(w, signal.SIGCONT)
+
+    def test_reload_during_a_failed_spawn_is_retried(self):
+        self.start()
+        exe = Path(self.d, "srv")
+        shutil.copy(ROOT / os.environ["FAULT"], exe)
+        self.p.terminate()
+        self.p.wait(10)
+        self.p = subprocess.Popen([str(exe), "-c", str(Path(self.d, "c.conf")), "-s"], stderr=self.err)
+        self.wait(lambda: self.get() == 200)
+        w = self.workers()[0]
+        exe.rename(str(exe) + "x")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: "띄우지 못했습니다" in self.text())
+        time.sleep(1.5)
+        self.assertLess(self.text().count("띄우지 못했습니다"), 8)  # 간격이 두 배씩 늘어난다
+        Path(str(exe) + "x").rename(exe)
+        self.wait(lambda: self.workers() and w not in self.workers() and self.get() == 200)
+
+    def test_stopping_with_a_hung_loop_still_ends(self):
+        for supervise in (True, False):
+            self.start("watchdog off\n", supervise)
+            self.get("/__fault/hang", timeout=0.2)
+            t = time.time()
+            self.p.terminate()
+            self.p.wait(12)  # 예전에는 멈춘 루프를 영원히 기다렸다
+            self.assertLess(time.time() - t, 10)
+            self.assertIn("강제로 끝냅니다", self.text())
+            self.tearDown()
+        self.start()
+
+
+@unittest.skipUnless(os.environ.get("FAULT"), "고장 주입 빌드에서만 (make e2e가 켠다)")
+class Faults(unittest.TestCase):
+    def test_disk_error_is_500_and_fd_shortage_is_503(self):
+        # 예전 구현의 결함: fd가 모자라면 있는 파일도 404, 500을 보내는 길이 없음
+        global BIN
+        saved, BIN = BIN, str(ROOT / os.environ["FAULT"])
+        s = Server(f"route * / static {ROOT}/www\n")
+        try:
+            self.assertEqual(s.get("/__fault/eio")[0], 500)
+            self.assertEqual(s.get("/__fault/emfile")[0], 503)
+        finally:
+            BIN = saved
+            s.stop()
+
+# ---- 감독 프로세스 ----
+
+class Supervisor(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="webserver-sup-")
+        for n in ("a", "b"):
+            Path(self.d, n).mkdir()
+            Path(self.d, n, "index.html").write_text(n)
+            Path(self.d, n, "big").write_bytes(n.encode() * (20 << 20))
+        self.port = free_port()
+        self.conf = Path(self.d, "c.conf")
+        self.write("a")
+        self.err = open(Path(self.d, "err"), "w+")
+        self.p = subprocess.Popen([BIN, "-s", "-c", str(self.conf)], stderr=self.err)
+        self.wait(lambda: self.get() == "a")
+
+    def tearDown(self):
+        if self.p.poll() is None:
+            self.p.terminate()
+            self.p.wait(15)
+        text = Path(self.d, "err").read_text()
+        self.err.close()
+        shutil.rmtree(self.d, ignore_errors=True)
+        self.assertNotRegex(text, r"Sanitizer|runtime error")
+
+    def write(self, which, extra=""):
+        self.conf.write_text(f"listen 127.0.0.1:{self.port}\nloops 2\naccess_log off\nroute * / static {self.d}/{which}\n{extra}")
+
+    def get(self):
+        try:
+            c = socket.create_connection(("127.0.0.1", self.port), 2)
+            c.settimeout(3)
+            c.sendall(b"GET / HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+            out = b""
+            while d := c.recv(4096):
+                out += d
+            c.close()
+            return parse(out)[2].decode()
+        except (OSError, ValueError):
+            return None
+
+    def wait(self, f, limit=8):
+        end = time.time() + limit
+        while time.time() < end:
+            if f():
+                return
+            time.sleep(0.05)
+        self.fail(Path(self.d, "err").read_text())
+
+    def workers(self):
+        return [int(x) for x in subprocess.run(["pgrep", "-P", str(self.p.pid)], capture_output=True).stdout.split()]
+
+    def hup(self, which):
+        n = Path(self.d, "err").read_text().count("준비됨")
+        self.write(which)
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: Path(self.d, "err").read_text().count("준비됨") > n)
+
+    def test_reload_without_losing_a_request(self):
+        big = socket.socket()
+        big.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+        big.connect(("127.0.0.1", self.port))
+        big.settimeout(10)
+        big.sendall(b"GET /big HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        got = big.recv(1000)
+        lost, stop = [], threading.Event()
+
+        def hammer():
+            while not stop.is_set():
+                if self.get() not in ("a", "b"):
+                    lost.append(1)
+        ts = [threading.Thread(target=hammer) for _ in range(12)]
+        [t.start() for t in ts]
+        for i in range(6):
+            self.hup("ba"[i % 2])
+        stop.set()
+        [t.join() for t in ts]
+        self.assertEqual(lost, [])
+        while d := big.recv(1 << 20):  # 옛 워커가 하던 다운로드는 끝까지
+            got += d
+        self.assertEqual(len(got) - got.index(b"\r\n\r\n") - 4, 20 << 20)
+        self.assertEqual(set(got[-1000:]), set(b"a"))
+        big.close()
+        self.wait(lambda: len(self.workers()) == 1)
+
+    def test_stop_after_reload_still_finishes_old_downloads(self):
+        big = socket.socket()
+        big.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+        big.connect(("127.0.0.1", self.port))
+        big.settimeout(10)
+        big.sendall(b"GET /big HTTP/1.1\r\n" + H + b"Connection: close\r\n\r\n")
+        got = len(big.recv(1000))
+        self.hup("b")
+        self.p.terminate()  # 옛 워커에게는 이미 한 번 갔으므로, 또 보내 "당장 끝내라"로 만들면 안 된다
+        time.sleep(0.5)
+        while d := big.recv(1 << 20):
+            got += len(d)
+        self.assertGreater(got, 20 << 20)
+        big.close()
+        self.assertEqual(self.p.wait(10), 0)
+
+    def test_address_change_is_refused_by_reload(self):
+        self.conf.write_text(f"listen 0.0.0.0:{self.port}\nloops 2\naccess_log off\nroute * / static {self.d}/b\n")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: "시작하지 못했습니다" in Path(self.d, "err").read_text())
+        self.assertEqual(self.get(), "a")
+
+    def test_supervisor_does_not_give_up(self):
+        exe = Path(self.d, "srv")
+        shutil.copy(BIN, exe)
+        self.p.terminate()
+        self.p.wait(10)
+        self.p = subprocess.Popen([str(exe), "-s", "-c", str(self.conf)], stderr=self.err)
+        self.wait(lambda: self.get() == "a")
+        w = self.workers()[0]
+        exe.rename(str(exe) + "x")  # 실행 파일을 교체하는 순간 워커가 죽었다
+        os.kill(w, signal.SIGKILL)
+        time.sleep(0.6)
+        Path(str(exe) + "x").rename(exe)
+        self.wait(lambda: self.get() == "a")
+
+    def test_supervisor_survives_a_lost_log_reader(self):
+        self.p.terminate()
+        self.p.wait(10)
+        r, w = os.pipe()
+        self.p = subprocess.Popen([BIN, "-s", "-c", str(self.conf)], stderr=w)
+        os.close(w)
+        self.wait(lambda: self.get() == "a")
+        os.close(r)
+        self.write("b")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: self.get() == "b")
+        self.assertIsNone(self.p.poll())
+
+    def test_bad_config_keeps_the_old_one(self):
+        self.write("b", "nonsense here\n")
+        self.p.send_signal(signal.SIGHUP)
+        time.sleep(1)
+        self.assertEqual(self.get(), "a")
+        self.write("b")
+        self.p.send_signal(signal.SIGHUP)
+        self.wait(lambda: self.get() == "b")
+
+    def test_crashed_worker_comes_back(self):
+        w = self.workers()[0]
+        os.kill(w, signal.SIGKILL)
+        self.wait(lambda: self.workers() not in ([], [w]) and self.get() == "a")
+
+    def test_stop_and_orphan(self):
+        w = self.workers()[0]
+        self.p.terminate()
+        self.assertEqual(self.p.wait(10), 0)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(w, 0)
+        self.p = subprocess.Popen([BIN, "-s", "-c", str(self.conf)], stderr=self.err)
+        self.wait(lambda: self.get() == "a")
+        w = self.workers()[0]
+        self.p.kill()  # 감독만 갑자기 죽어도 워커가 혼자 남지 않는다
+        self.p.wait()
+
+        def gone():
+            try:
+                os.kill(w, 0)
+                return False
+            except ProcessLookupError:
+                return True
+        self.wait(gone)
+
+    def test_bad_config_at_start(self):
+        bad = Path(self.d, "bad.conf")
+        bad.write_text("nonsense x\n")
+        self.assertEqual(subprocess.run([BIN, "-s", "-c", str(bad)], stderr=subprocess.DEVNULL, timeout=10).returncode, 2)
+
+
+class Config(unittest.TestCase):
+    def run_conf(self, text, *args):
+        with tempfile.NamedTemporaryFile("w", suffix=".conf") as f:
+            f.write(text)
+            f.flush()
+            p = subprocess.run([BIN, "-c", f.name, *args], stderr=subprocess.PIPE, timeout=5)
+            return p.returncode, p.stderr.decode()
+
+    def test_bad_line_tells_where(self):
+        code, err = self.run_conf("# 주석\n\nlisten 127.0.0.1:0\nmax_body 1zz\n")
+        self.assertEqual(code, 2)
+        self.assertIn(".conf:4:", err)
+
+    def test_port_in_use(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            s.listen()
+            code, err = self.run_conf(f"listen 127.0.0.1:{s.getsockname()[1]}\nroute * / static {ROOT}/www\n")
+        self.assertEqual(code, 1)
+        self.assertIn("Address already in use", err)
+
+    def test_restart_right_away(self):
+        # SO_REUSEADDR가 없으면 TIME_WAIT 때문에 두 번째 실행이 실패한다
+        s = Server(f"route * / static {ROOT}/www\n")
+        self.assertEqual(s.get("/")[0], 200)
+        port = s.port
+        s.stop()
+        code = None
+        p = subprocess.Popen([BIN, "-p", str(port), "-r", f"{ROOT}/www"], stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.4)
+            code = p.poll()
+        finally:
+            p.terminate()
+            p.wait()
+        self.assertIsNone(code)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

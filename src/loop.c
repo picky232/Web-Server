@@ -1,0 +1,180 @@
+#include "loop.h"
+#include "conn.h"
+#include "crash.h"
+#include "log.h"
+#include "server.h"
+#include "str.h"
+#include "upstream.h"
+
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define MAX_EVENTS 256
+#define SCAN_MS 250 /* 제한 시간 검사 간격 */
+
+void loop_watch(struct loop *l, struct io *io, unsigned want)
+{
+    if (!io->dead && want != io->want && ev_set(l->evfd, io, want) < 0)
+        log_note("ev_set: %s", strerror(errno));
+}
+
+void loop_bury(struct loop *l, struct io *io)
+{
+    if (io->dead)
+        return;
+    /* 이번 묶음에 이 io의 이벤트가 또 들어 있을 수 있다.
+       바로 free하면 그 이벤트가 해제된 메모리를 가리키므로 바퀴 끝까지 미룬다 */
+    loop_watch(l, io, 0);
+    close(io->fd);
+    io->dead = true;
+    io->next_dead = l->dead;
+    l->dead = io;
+}
+
+static void reap_dead(struct loop *l)
+{
+    while (l->dead) {
+        struct io *io = l->dead;
+        l->dead = io->next_dead;
+        switch (io->kind) {
+        case IO_CLIENT: conn_free((struct conn *)io); break;
+        case IO_UPSTREAM: upconn_free((struct upconn *)io); break;
+        default: free(io); break;
+        }
+    }
+}
+
+void loop_ready(struct loop *l, struct conn *c)
+{
+    if (c->in_ready)
+        return;
+    c->in_ready = true;
+    c->next_ready = l->ready;
+    l->ready = c;
+}
+
+static void run_ready(struct loop *l)
+{
+    struct conn *c = l->ready;
+    l->ready = NULL;
+    while (c) {
+        struct conn *next = c->next_ready;
+        c->in_ready = false;
+        if (!c->io.dead)
+            conn_run(c);
+        c = next;
+    }
+}
+
+bool loop_send(struct loop *l, const struct msg *m)
+{
+    return write(l->pipe[1], m, sizeof *m) == (ssize_t)sizeof *m;
+}
+
+static void read_mail(struct loop *l)
+{
+    struct msg m[32];
+    ssize_t n;
+    while ((n = read(l->pipe[0], m, sizeof m)) > 0) {
+        for (size_t i = 0; i < (size_t)n / sizeof *m; i++) {
+            switch (m[i].type) {
+            case MSG_CONN: conn_open(l, m[i].fd, m[i].origin, &m[i].peer); break;
+            case MSG_WAKE: break;
+            }
+        }
+    }
+}
+
+static void *loop_main(void *arg)
+{
+    struct loop *l = arg;
+    struct ev_event ev[MAX_EVENTS];
+    void *stack = crash_thread_begin();
+    while (!l->quit) {
+        atomic_fetch_add_explicit(&l->beats, 1, memory_order_relaxed);
+        /* 루프 스레드가 잠드는 곳은 프로그램 전체에서 이 한 줄뿐이다 */
+        int n = ev_wait(l->evfd, ev, MAX_EVENTS, l->ready ? 0 : SCAN_MS);
+        long long woke = now_us();
+        l->now = woke / 1000;
+        int phase = atomic_load(&l->srv->phase);
+        l->draining = phase >= PHASE_DRAIN;
+        l->quit = phase >= PHASE_KILL;
+        for (int i = 0; i < n && atomic_load(&l->srv->phase) < PHASE_KILL; i++) {
+            struct io *io = ev[i].io;
+            if (io->dead)
+                continue;
+            io->ready |= ev[i].ready;
+            switch (io->kind) {
+            case IO_PIPE: read_mail(l); break;
+            case IO_CLIENT: conn_run((struct conn *)io); break;
+            case IO_UPSTREAM: upstream_event((struct upconn *)io); break;
+            default: break;
+            }
+        }
+        run_ready(l);
+        if (l->now >= l->next_scan || l->draining) {
+            conn_scan(l);
+            upstream_scan(l);
+            l->next_scan = l->now + SCAN_MS;
+        }
+        reap_dead(l);
+        log_flush(l);
+        long long busy = now_us() - woke;
+        if (busy > atomic_load_explicit(&l->max_busy_us, memory_order_relaxed))
+            atomic_store_explicit(&l->max_busy_us, busy, memory_order_relaxed);
+        if (l->draining && !l->conns) {
+            read_mail(l); /* 종료 직전에 받은 연결이 쪽지함에 남아 있을 수 있다 */
+            if (!l->conns)
+                break;
+        }
+    }
+    conn_close_all(l);
+    upstream_close_all(l);
+    reap_dead(l);
+    log_flush(l);
+    buf_free(&l->log);
+    crash_thread_end(stack);
+    atomic_store(&l->done, true);
+    atomic_fetch_sub(&l->srv->loops_alive, 1);
+    return NULL;
+}
+
+int loop_start(struct loop *l, int id, struct server *srv)
+{
+    memset(l, 0, sizeof *l);
+    l->id = id;
+    l->srv = srv;
+    buf_init(&l->log, 65536);
+    l->evfd = ev_open();
+    l->idle = calloc((size_t)srv->cfg->nbackends + 1, sizeof *l->idle);
+    if (l->evfd < 0 || !l->idle || net_pipe(l->pipe) < 0)
+        return -1;
+    l->pipe_io = (struct io){.fd = l->pipe[0], .kind = IO_PIPE};
+    loop_watch(l, &l->pipe_io, IO_R);
+
+    /* 시그널은 메인 스레드만 받게, 새 스레드는 전부 막고 시작한다 (마스크는 물려받는다) */
+    atomic_fetch_add(&srv->loops_alive, 1);
+    sigset_t all, old;
+    sigfillset(&all);
+    /* 잘못된 메모리 접근처럼 이 스레드 자신이 일으키는 것은 막지 않는다.
+       막으면 죽음 기록이 남지 않고, macOS에서는 죽지도 않고 같은 명령을 끝없이 반복한다 */
+    crash_unblock(&all);
+    pthread_sigmask(SIG_SETMASK, &all, &old);
+    int err = pthread_create(&l->thread, NULL, loop_main, l);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    errno = err;
+    return err ? -1 : 0;
+}
+
+void loop_join(struct loop *l)
+{
+    pthread_join(l->thread, NULL);
+    close(l->pipe[0]);
+    close(l->pipe[1]);
+    close(l->evfd);
+    free(l->idle);
+}

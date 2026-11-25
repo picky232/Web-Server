@@ -1,232 +1,348 @@
-/*
- * config.c — 명령행 인자를 server_config_t 로 변환한다.
- *
- * getopt_long 대신 직접 argv 를 순회한다. 전역 상태(optind)가 없어서
- * 단위 테스트에서 여러 번 호출해도 안전하고, 동작을 그대로 읽을 수 있다.
- */
 #include "config.h"
+#include "app.h"
+#include "log.h"
 
 #include <errno.h>
-#include <limits.h>
+#include <fcntl.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-void config_set_defaults(server_config_t *cfg)
+void config_defaults(struct config *c)
 {
-    memset(cfg, 0, sizeof *cfg);
-    snprintf(cfg->bind_addr, sizeof cfg->bind_addr, "%s", "0.0.0.0");
-    cfg->port = 8080;
-    snprintf(cfg->doc_root, sizeof cfg->doc_root, "%s", "./www");
-    cfg->threads = 4;
-    cfg->queue_capacity = 64;
-    snprintf(cfg->proxy_prefix, sizeof cfg->proxy_prefix, "%s", "/api");
-    cfg->backend_count = 0;
-    cfg->read_timeout_ms = 10000;
-    cfg->keepalive_timeout_ms = 5000;
-    cfg->proxy_timeout_ms = 5000;
-    cfg->max_body_bytes = 1024ULL * 1024ULL; /* 1 MiB */
-    cfg->max_requests_per_conn = 100;
-    cfg->quiet = false;
+    memset(c, 0, sizeof *c);
+    net_parse_addr("127.0.0.1:8080", &c->listen); /* 기본은 내 컴퓨터에서만. 밖으로 열 때만 명시한다 */
+    c->max_connections = 4096;
+    c->max_body = 10 << 20;
+    c->max_disk = 256 << 20;
+    c->cache_size = 64 << 20;
+    c->min_rate = 1024;
+    c->head_ms = 10000;
+    c->idle_ms = 15000;
+    c->connect_ms = 1000;
+    c->response_ms = 30000;
+    c->stall_ms = 30000;
+    c->drain_ms = 10000;
+    c->health_ms = 2000;
+    c->watchdog = true;
+    strcpy(c->access_log, "-");
 }
 
-static void set_err(char *err, size_t errlen, const char *fmt, ...)
+static bool fail(char *err, size_t cap, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static bool fail(char *err, size_t cap, const char *fmt, ...)
 {
-    if (err == NULL || errlen == 0)
-        return;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(err, errlen, fmt, ap);
+    vsnprintf(err, cap, fmt, ap);
     va_end(ap);
+    return false;
 }
 
-/* 10진 정수 문자열을 [min, max] 범위로 엄격하게 파싱한다 ("12abc", "" 거부). */
-static bool parse_long_range(const char *s, long min, long max, long *out)
+/* "10m" → 10485760. 단위는 k, m, g */
+static bool parse_size(const char *s, long long lo, long long hi, long long *out)
 {
-    if (s == NULL || *s == '\0')
-        return false;
+    char *end;
     errno = 0;
-    char *end = NULL;
+    long long v = strtoll(s, &end, 10);
+    int shift = *end == 'k' ? 10 : *end == 'm' ? 20 : *end == 'g' ? 30 : 0;
+    if (shift)
+        end++;
+    if (errno || end == s || *end || v < 0 || v > (hi >> shift))
+        return false;
+    *out = v << shift;
+    return *out >= lo;
+}
+
+/* "10s", "500ms" → 밀리초 */
+static bool parse_ms(const char *s, int *out)
+{
+    char *end;
+    errno = 0;
     long v = strtol(s, &end, 10);
-    if (errno != 0 || *end != '\0' || v < min || v > max)
+    if (errno || end == s || v <= 0 || v > 3600000)
         return false;
-    *out = v;
-    return true;
+    if (!strcmp(end, "s"))
+        v *= 1000;
+    else if (strcmp(end, "ms"))
+        return false;
+    *out = (int)v;
+    return v <= 3600000;
 }
 
-/* "host:port" → backend_spec_t. host 부분은 DNS 해석 전 문자열 그대로 둔다. */
-static bool parse_backend(const char *s, backend_spec_t *b)
+static struct pool *find_pool(struct config *c, const char *name)
 {
-    const char *colon = strrchr(s, ':');
-    if (colon == NULL || colon == s)
-        return false;
-    size_t host_len = (size_t)(colon - s);
-    if (host_len >= sizeof b->host)
-        return false;
-    long port;
-    if (!parse_long_range(colon + 1, 1, 65535, &port))
-        return false;
-    memcpy(b->host, s, host_len);
-    b->host[host_len] = '\0';
-    b->port = (int)port;
-    return true;
+    for (int i = 0; i < c->npools; i++)
+        if (!strcmp(c->pools[i].name, name))
+            return &c->pools[i];
+    return NULL;
 }
 
-static bool is_opt(const char *arg, const char *short_name, const char *long_name)
+/* pool 이름 [least_conn|round_robin] [max=N] [health=tcp|/경로] 주소... */
+static bool parse_pool(struct config *c, char **t, int n, char *err, size_t cap)
 {
-    return (short_name != NULL && strcmp(arg, short_name) == 0) ||
-           (long_name != NULL && strcmp(arg, long_name) == 0);
-}
-
-config_result_t config_parse_args(server_config_t *cfg, int argc, char **argv,
-                                  char *err, size_t errlen)
-{
-    for (int i = 1; i < argc; i++) {
-        const char *opt = argv[i];
-
-        /* 값이 없는 옵션 */
-        if (is_opt(opt, "-h", "--help"))
-            return CONFIG_HELP;
-        if (is_opt(opt, "-q", "--quiet")) {
-            cfg->quiet = true;
-            continue;
-        }
-
-        /* 나머지는 모두 "--옵션 값" 형태 */
-        static const char *const with_value[] = {
-            "-p", "--port", "-r", "--root", "-t", "--threads", "--queue",
-            "--bind", "--proxy-prefix", "-b", "--backend", "--read-timeout-ms",
-            "--keepalive-ms", "--proxy-timeout-ms", "--max-body",
-            "--max-requests", NULL};
-        bool known = false;
-        for (int k = 0; with_value[k] != NULL; k++)
-            if (strcmp(opt, with_value[k]) == 0)
-                known = true;
-        if (!known) {
-            set_err(err, errlen, "unknown option '%s'", opt);
-            return CONFIG_ERROR;
-        }
-        if (i + 1 >= argc) {
-            set_err(err, errlen, "option '%s' requires a value", opt);
-            return CONFIG_ERROR;
-        }
-        const char *val = argv[++i];
-        long n = 0;
-
-        if (is_opt(opt, "-p", "--port")) {
-            if (!parse_long_range(val, 0, 65535, &n)) {
-                set_err(err, errlen, "invalid port '%s' (0-65535)", val);
-                return CONFIG_ERROR;
-            }
-            cfg->port = (int)n;
-        } else if (is_opt(opt, "-r", "--root")) {
-            if (strlen(val) >= sizeof cfg->doc_root) {
-                set_err(err, errlen, "document root path too long");
-                return CONFIG_ERROR;
-            }
-            snprintf(cfg->doc_root, sizeof cfg->doc_root, "%s", val);
-        } else if (is_opt(opt, "-t", "--threads")) {
-            if (!parse_long_range(val, 1, 256, &n)) {
-                set_err(err, errlen, "invalid thread count '%s' (1-256)", val);
-                return CONFIG_ERROR;
-            }
-            cfg->threads = (int)n;
-        } else if (is_opt(opt, NULL, "--queue")) {
-            if (!parse_long_range(val, 1, 65536, &n)) {
-                set_err(err, errlen, "invalid queue capacity '%s' (1-65536)", val);
-                return CONFIG_ERROR;
-            }
-            cfg->queue_capacity = (int)n;
-        } else if (is_opt(opt, NULL, "--bind")) {
-            if (strlen(val) >= sizeof cfg->bind_addr) {
-                set_err(err, errlen, "bind address too long");
-                return CONFIG_ERROR;
-            }
-            snprintf(cfg->bind_addr, sizeof cfg->bind_addr, "%s", val);
-        } else if (is_opt(opt, NULL, "--proxy-prefix")) {
-            size_t len = strlen(val);
-            if (len < 2 || len >= sizeof cfg->proxy_prefix || val[0] != '/') {
-                set_err(err, errlen, "proxy prefix must look like '/api'");
-                return CONFIG_ERROR;
-            }
-            snprintf(cfg->proxy_prefix, sizeof cfg->proxy_prefix, "%s", val);
-            /* "/api/" 처럼 끝 '/' 는 제거해서 "/api" 로 통일 */
-            while (len > 1 && cfg->proxy_prefix[len - 1] == '/')
-                cfg->proxy_prefix[--len] = '\0';
-            if (len < 2) {
-                set_err(err, errlen, "proxy prefix must not be '/'");
-                return CONFIG_ERROR;
-            }
-        } else if (is_opt(opt, "-b", "--backend")) {
-            if (cfg->backend_count >= CONFIG_MAX_BACKENDS) {
-                set_err(err, errlen, "at most %d backends are supported",
-                        CONFIG_MAX_BACKENDS);
-                return CONFIG_ERROR;
-            }
-            if (!parse_backend(val, &cfg->backends[cfg->backend_count])) {
-                set_err(err, errlen, "invalid backend '%s' (expected host:port)", val);
-                return CONFIG_ERROR;
-            }
-            cfg->backend_count++;
-        } else if (is_opt(opt, NULL, "--read-timeout-ms")) {
-            if (!parse_long_range(val, 100, 600000, &n)) {
-                set_err(err, errlen, "invalid read timeout '%s' (100-600000 ms)", val);
-                return CONFIG_ERROR;
-            }
-            cfg->read_timeout_ms = (int)n;
-        } else if (is_opt(opt, NULL, "--keepalive-ms")) {
-            if (!parse_long_range(val, 100, 600000, &n)) {
-                set_err(err, errlen, "invalid keep-alive timeout '%s' (100-600000 ms)", val);
-                return CONFIG_ERROR;
-            }
-            cfg->keepalive_timeout_ms = (int)n;
-        } else if (is_opt(opt, NULL, "--proxy-timeout-ms")) {
-            if (!parse_long_range(val, 100, 600000, &n)) {
-                set_err(err, errlen, "invalid proxy timeout '%s' (100-600000 ms)", val);
-                return CONFIG_ERROR;
-            }
-            cfg->proxy_timeout_ms = (int)n;
-        } else if (is_opt(opt, NULL, "--max-body")) {
-            if (!parse_long_range(val, 0, 1024L * 1024L * 1024L, &n)) {
-                set_err(err, errlen, "invalid max body '%s' (0-1073741824 bytes)", val);
-                return CONFIG_ERROR;
-            }
-            cfg->max_body_bytes = (unsigned long long)n;
-        } else if (is_opt(opt, NULL, "--max-requests")) {
-            if (!parse_long_range(val, 1, 100000, &n)) {
-                set_err(err, errlen, "invalid max requests '%s' (1-100000)", val);
-                return CONFIG_ERROR;
-            }
-            cfg->max_requests_per_conn = (int)n;
+    if (n < 2 || strlen(t[1]) >= sizeof c->pools[0].name)
+        return fail(err, cap, "pool: 이름이 필요합니다");
+    if (strspn(t[1], "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(t[1]))
+        return fail(err, cap, "pool: 이름에는 영문, 숫자, _, - 만 쓸 수 있습니다: %s", t[1]);
+    if (find_pool(c, t[1]))
+        return fail(err, cap, "pool %s: 이미 있는 이름입니다", t[1]);
+    if (c->npools == (int)(sizeof c->pools / sizeof c->pools[0]))
+        return fail(err, cap, "pool이 너무 많습니다");
+    struct pool *p = &c->pools[c->npools];
+    memset(p, 0, sizeof *p);
+    strcpy(p->name, t[1]);
+    p->max_inflight = 256;
+    for (int i = 2; i < n; i++) {
+        long long v;
+        if (!strcmp(t[i], "least_conn"))
+            p->policy = LEAST_CONN;
+        else if (!strcmp(t[i], "round_robin"))
+            p->policy = ROUND_ROBIN;
+        else if (!strncmp(t[i], "max=", 4)) {
+            if (!parse_size(t[i] + 4, 1, 100000, &v))
+                return fail(err, cap, "pool %s: 잘못된 값 %s", p->name, t[i]);
+            p->max_inflight = (int)v;
+        } else if (!strcmp(t[i], "health=tcp")) {
+            p->health[0] = '\0';
+        } else if (!strncmp(t[i], "health=/", 8) && strlen(t[i] + 7) < sizeof p->health) {
+            strcpy(p->health, t[i] + 7);
+        } else {
+            struct backend *b = &p->be[p->n];
+            if (p->n == POOL_MAX_BACKENDS || strlen(t[i]) >= sizeof b->name || !net_parse_addr(t[i], &b->addr))
+                return fail(err, cap, "pool %s: 백엔드 주소를 읽을 수 없습니다: %s", p->name, t[i]);
+            strcpy(b->name, t[i]);
+            b->index = c->nbackends++;
+            p->n++;
         }
     }
-    return CONFIG_OK;
+    if (p->n == 0)
+        return fail(err, cap, "pool %s: 백엔드가 없습니다", p->name);
+    c->npools++;
+    return true;
 }
 
-void config_print_usage(FILE *out, const char *prog)
+static bool open_dir(struct route *r, const char *dir, char *err, size_t cap)
 {
-    fprintf(out,
-            "Usage: %s [options]\n"
-            "\n"
-            "A small HTTP/1.1 server: static files + reverse proxy + thread pool.\n"
-            "\n"
-            "Options:\n"
-            "  -p, --port N             listening port (default 8080, 0 = pick a free port)\n"
-            "      --bind ADDR          IPv4 address to bind (default 0.0.0.0)\n"
-            "  -r, --root DIR           document root for static files (default ./www)\n"
-            "  -t, --threads N          worker threads (default 4)\n"
-            "      --queue N            pending-connection queue capacity (default 64)\n"
-            "  -b, --backend HOST:PORT  reverse-proxy backend; repeat for round-robin (max %d)\n"
-            "      --proxy-prefix PATH  path prefix routed to the backend (default /api)\n"
-            "      --read-timeout-ms N  time allowed to receive one request (default 10000)\n"
-            "      --keepalive-ms N     idle time before closing a keep-alive connection (default 5000)\n"
-            "      --proxy-timeout-ms N backend connect/response timeout (default 5000)\n"
-            "      --max-body N         max request body bytes (default 1048576)\n"
-            "      --max-requests N     max requests per connection (default 100)\n"
-            "  -q, --quiet              disable per-request access log\n"
-            "  -h, --help               show this help\n"
-            "\n"
-            "Example:\n"
-            "  %s --port 8080 --root ./www --threads 4 --backend 127.0.0.1:9000\n",
-            prog, CONFIG_MAX_BACKENDS, prog);
+    r->root_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (r->root_fd < 0)
+        return fail(err, cap, "폴더를 열 수 없습니다: %s: %s", dir, strerror(errno));
+    return true;
+}
+
+/* route 호스트 접두사 static 폴더 | proxy 묶음 [cache [cookies]] | app 대상 */
+static bool parse_route(struct config *c, char **t, int n, char *err, size_t cap)
+{
+    if (n < 5)
+        return fail(err, cap, "route: '호스트 접두사 동작 대상' 네 개가 필요합니다");
+    if (c->nroutes == (int)(sizeof c->routes / sizeof c->routes[0]))
+        return fail(err, cap, "route가 너무 많습니다");
+    struct route *r = &c->routes[c->nroutes];
+    memset(r, 0, sizeof *r);
+    r->root_fd = -1;
+    if (strlen(t[1]) >= sizeof r->host || t[2][0] != '/' || strlen(t[2]) >= sizeof r->prefix)
+        return fail(err, cap, "route: 접두사는 '/'로 시작해야 합니다: %s", t[2]);
+    for (size_t i = 0; t[1][i]; i++)
+        r->host[i] = (char)(t[1][i] >= 'A' && t[1][i] <= 'Z' ? t[1][i] + 32 : t[1][i]);
+    strcpy(r->prefix, t[2]);
+    r->prefix_len = strlen(r->prefix);
+    while (r->prefix_len && r->prefix[r->prefix_len - 1] == '/')
+        r->prefix[--r->prefix_len] = '\0';
+    if (!strcmp(t[3], "static")) {
+        r->act = ACT_STATIC;
+        if (!open_dir(r, t[4], err, cap))
+            return false;
+    } else if (!strcmp(t[3], "proxy")) {
+        r->act = ACT_PROXY;
+        r->pool = find_pool(c, t[4]);
+        if (!r->pool)
+            return fail(err, cap, "route: 없는 pool입니다: %s (pool 줄을 먼저 적으세요)", t[4]);
+        for (int i = 5; i < n; i++) {
+            if (!strcmp(t[i], "cache"))
+                r->cache = true;
+            else if (!strcmp(t[i], "cookies") && r->cache)
+                r->cache_cookies = true;
+            else
+                return fail(err, cap, "route: 모르는 옵션입니다: %s (cache, cache cookies)", t[i]);
+        }
+    } else if (!strcmp(t[3], "app")) {
+        r->act = ACT_APP;
+        if (n != 5)
+            return fail(err, cap, "route: app 뒤에는 대상 하나만 적습니다");
+        if (!app_open(t[4], err, cap))
+            return false;
+    } else {
+        return fail(err, cap, "route: 모르는 동작입니다: %s", t[3]);
+    }
+    c->nroutes++;
+    return true;
+}
+
+bool config_line(struct config *c, char *line, char *err, size_t cap)
+{
+    char *t[64];
+    int n = 0;
+    char *hash = strchr(line, '#');
+    if (hash)
+        *hash = '\0';
+    char *save;
+    for (char *w = strtok_r(line, " \t\r\n", &save); w; w = strtok_r(NULL, " \t\r\n", &save)) {
+        if (n == 64)
+            return fail(err, cap, "한 줄에 값이 너무 많습니다");
+        t[n++] = w;
+    }
+    if (n == 0)
+        return true;
+    if (!strcmp(t[0], "pool"))
+        return parse_pool(c, t, n, err, cap);
+    if (!strcmp(t[0], "route"))
+        return parse_route(c, t, n, err, cap);
+    if (n != 2)
+        return fail(err, cap, "%s: 값 하나가 필요합니다", t[0]);
+
+    const struct {
+        const char *name;
+        int *ms;
+    } times[] = {
+        {"timeout_head", &c->head_ms}, {"timeout_idle", &c->idle_ms}, {"timeout_connect", &c->connect_ms},
+        {"timeout_response", &c->response_ms}, {"timeout_stall", &c->stall_ms}, {"timeout_drain", &c->drain_ms},
+        {"health_interval", &c->health_ms},
+    };
+    for (size_t i = 0; i < sizeof times / sizeof times[0]; i++)
+        if (!strcmp(t[0], times[i].name))
+            return parse_ms(t[1], times[i].ms) ||
+                   fail(err, cap, "%s: 시간은 10s나 500ms처럼 적습니다: %s", t[0], t[1]);
+
+    long long v = 0;
+    bool ok;
+    if (!strcmp(t[0], "listen")) {
+        ok = net_parse_addr(t[1], &c->listen);
+    } else if (!strcmp(t[0], "admin")) {
+        ok = c->has_admin = net_parse_addr(t[1], &c->admin);
+    } else if (!strcmp(t[0], "loops")) {
+        ok = !strcmp(t[1], "auto") || parse_size(t[1], 1, 256, &v);
+        c->loops = (int)v;
+    } else if (!strcmp(t[0], "max_connections")) {
+        ok = parse_size(t[1], 1, 1000000, &v);
+        c->max_connections = (int)v;
+    } else if (!strcmp(t[0], "max_body")) {
+        ok = parse_size(t[1], 0, 1LL << 40, &c->max_body);
+    } else if (!strcmp(t[0], "max_upload_disk")) {
+        ok = parse_size(t[1], 0, 1LL << 40, &c->max_disk);
+    } else if (!strcmp(t[0], "cache_size")) {
+        ok = parse_size(t[1], 0, 1LL << 40, &c->cache_size);
+    } else if (!strcmp(t[0], "min_rate")) {
+        ok = parse_size(t[1], 1, 1 << 30, &v);
+        c->min_rate = (int)v;
+    } else if (!strcmp(t[0], "watchdog")) {
+        ok = !strcmp(t[1], "on") || !strcmp(t[1], "off");
+        c->watchdog = !strcmp(t[1], "on");
+    } else if (!strcmp(t[0], "access_log")) {
+        ok = strlen(t[1]) < sizeof c->access_log;
+        if (ok)
+            strcpy(c->access_log, !strcmp(t[1], "off") ? "" : t[1]);
+    } else {
+        return fail(err, cap, "모르는 설정입니다: %s", t[0]);
+    }
+    return ok || fail(err, cap, "%s: 잘못된 값입니다: %s", t[0], t[1]);
+}
+
+bool config_load(struct config *c, const char *path)
+{
+    FILE *f = fopen(path, "re");
+    if (!f) {
+        log_note("%s: %s", path, strerror(errno));
+        return false;
+    }
+    char line[4096], err[512];
+    bool ok = true;
+    for (int no = 1; ok && fgets(line, sizeof line, f); no++) {
+        ok = config_line(c, line, err, sizeof err);
+        if (!ok)
+            log_note("%s:%d: %s", path, no, err);
+    }
+    fclose(f);
+    return ok;
+}
+
+static void usage(const char *prog)
+{
+    printf("사용법: %s [-c 설정파일] [-p 포트] [-r 정적폴더] [-t 루프수] [-s]\n"
+           "  -c FILE  설정 파일 (예: conf/example.conf)\n"
+           "  -p PORT  포트 (설정 파일보다 우선)\n"
+           "  -r DIR   '/'에 정적 파일로 연결할 폴더 (설정 파일보다 우선)\n"
+           "  -t N     이벤트 루프 수 (기본: 코어 수)\n"
+           "  -s       감독 프로세스로 실행 (SIGHUP으로 무중단 설정 변경, 죽으면 다시 띄움)\n",
+           prog);
+}
+
+int config_args(struct config *c, int argc, char **argv)
+{
+    const char *file = NULL, *port = NULL, *root = NULL, *loops = NULL;
+    int opt;
+    while ((opt = getopt(argc, argv, "c:p:r:t:sh")) != -1) {
+        switch (opt) {
+        case 'c': file = optarg; break;
+        case 'p': port = optarg; break;
+        case 'r': root = optarg; break;
+        case 't': loops = optarg; break;
+        case 's': c->supervise = true; break;
+        case 'h': usage(argv[0]); return 1;
+        default: usage(argv[0]); return 2;
+        }
+    }
+    if (optind < argc) {
+        fprintf(stderr, "모르는 인자입니다: %s\n", argv[optind]);
+        return 2;
+    }
+    if (file && !config_load(c, file))
+        return 2;
+    char err[512];
+    if (port) {
+        char host[64], line[128];
+        net_ip(&c->listen, host, sizeof host);
+        snprintf(line, sizeof line, strchr(host, ':') ? "listen [%s]:%s" : "listen %s:%s", host, port);
+        if (!config_line(c, line, err, sizeof err)) {
+            fprintf(stderr, "-p: %s\n", err);
+            return 2;
+        }
+    }
+    if (loops) {
+        char line[64];
+        snprintf(line, sizeof line, "loops %s", loops);
+        if (!config_line(c, line, err, sizeof err)) {
+            fprintf(stderr, "-t: %s\n", err);
+            return 2;
+        }
+    }
+    if (root || c->nroutes == 0) {
+        /* "* /" 규칙이 이미 있으면 뺀다 */
+        for (int i = 0; root && i < c->nroutes; i++)
+            if (!strcmp(c->routes[i].host, "*") && c->routes[i].prefix_len == 0) {
+                if (c->routes[i].root_fd >= 0)
+                    close(c->routes[i].root_fd);
+                c->routes[i] = c->routes[--c->nroutes];
+                break;
+            }
+        char line[700];
+        /* 잘린 경로도 실제로 있는 다른 폴더일 수 있다. 그대로 열면 엉뚱한 폴더가 공개된다 */
+        if (snprintf(line, sizeof line, "route * / static %s", root ? root : "./www") >= (int)sizeof line) {
+            fprintf(stderr, "-r: 경로가 너무 깁니다\n");
+            return 2;
+        }
+        if (!config_line(c, line, err, sizeof err)) {
+            fprintf(stderr, "-r: %s\n", err);
+            return 2;
+        }
+    }
+    return 0;
+}
+
+void config_free(struct config *c)
+{
+    for (int i = 0; i < c->nroutes; i++)
+        if (c->routes[i].root_fd >= 0)
+            close(c->routes[i].root_fd);
+    free(c);
 }
