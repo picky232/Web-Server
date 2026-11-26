@@ -3,7 +3,7 @@
 cd "$(dirname "$0")" || exit 1
 CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 bad=0
-ids="${*:-flow pin silent thru fail sup arch tests compare}"
+ids="${*:-flow pin silent thru fail sup arch tests compare lb rec}"
 for id in $ids; do
   "$CHROME" --headless=new --disable-gpu --window-size=1280,1400 --virtual-time-budget=2000 --dump-dom "file://$PWD/figures/diagrams.html?fig=$id&audit=1" 2>/dev/null |
   python3 -I -c '
